@@ -1,0 +1,62 @@
+{
+  "entities": {
+    "UserShow": {
+      "title": "UserShow",
+      "description": "A radio show generated or saved by a user",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Show title",
+          "maxLength": 300
+        },
+        "duration": {
+          "type": "number",
+          "description": "Show duration in seconds"
+        },
+        "summary": {
+          "type": "string",
+          "description": "Show summary",
+          "maxLength": 2000
+        },
+        "date": {
+          "type": "string",
+          "description": "Generation date",
+          "maxLength": 50
+        },
+        "host": {
+          "type": "string",
+          "description": "Show host or persona",
+          "maxLength": 100
+        },
+        "coverImage": {
+          "type": "string",
+          "description": "Show cover image URL or data URI",
+          "maxLength": 1000000
+        },
+        "audioUrl": {
+          "type": "string",
+          "description": "Audio stream URL or data URI",
+          "maxLength": 1000000
+        },
+        "userId": {
+          "type": "string",
+          "description": "User identifier who created the show",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        }
+      },
+      "required": ["title", "userId"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/shows/{showId}": {
+      "schema": "UserShow",
+      "description": "Radio shows saved for a specific user"
+    }
+  }
+}

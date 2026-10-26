@@ -1,0 +1,8 @@
+{
+  "name": "占い AI Talk Radio",
+  "description": "GeminiSparkの占い情報をもとに、星読みパーソナリティやリスナーとの掛け合いで本格的な占いトークラジオ番組を自動生成・放送するAIラジオ局",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>占い AI Talk Radio</title>
+    <meta name="description" content="GeminiSparkの占い情報をもとに、星読みパーソナリティやリスナーとの掛け合いで本格的な占いトークラジオ番組を自動生成・放送するAIラジオ局" />
+    <meta property="og:title" content="占い AI Talk Radio" />
+    <meta property="og:description" content="GeminiSparkの占い情報をもとに、星読みパーソナリティやリスナーとの掛け合いで本格的な占いトークラジオ番組を自動生成・放送するAIラジオ局" />
+    <script>
+      // Suppress Vite HMR / WebSocket connection errors in AI Studio iframe environment
+      window.addEventListener('error', function(event) {
+        if (
+          (event.filename && event.filename.includes('@vite/client')) ||
+          (event.message && (event.message.includes('WebSocket') || event.message.includes('createWebSocketModuleRunnerTransport'))) ||
+          (event.error && event.error.stack && (event.error.stack.includes('@vite/client') || event.error.stack.includes('createWebSocketModuleRunnerTransport')))
+        ) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          return true;
+        }
+      }, true);
+      window.addEventListener('unhandledrejection', function(event) {
+        var reason = event.reason;
+        var reasonStr = String((reason && (reason.stack || reason.message)) || reason || '');
+        if (
+          reasonStr.includes('@vite/client') ||
+          reasonStr.includes('WebSocket') ||
+          reasonStr.includes('createWebSocketModuleRunnerTransport')
+        ) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      }, true);
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

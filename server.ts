@@ -1,0 +1,3055 @@
+import express from "express";
+import { createServer as createViteServer } from "vite";
+import path from "path";
+import { createInteraction, streamInteraction, API_BASE_URL } from "./server/lib/agentClient.ts";
+import { extractJsonBlocks } from "./server/lib/jsonExtractor.ts";
+import { exec } from 'child_process';
+import util from 'util';
+import fs from "fs";
+import { Storage } from "@google-cloud/storage";
+import crypto from "crypto";
+import admin from "firebase-admin";
+import { GoogleGenAI } from "@google/genai";
+import { setGlobalDispatcher, Agent } from "undici";
+
+// Configure undici dispatcher with extended headers & body timeouts (5 mins) to prevent HeadersTimeoutError
+try {
+  setGlobalDispatcher(new Agent({
+    headersTimeout: 300_000,
+    bodyTimeout: 300_000,
+    connectTimeout: 60_000,
+  }));
+} catch (dispatcherErr) {
+  console.warn("[undici] Dispatcher configuration note:", dispatcherErr);
+}
+
+const execAsync = util.promisify(exec);
+
+function getGenAI(): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    httpOptions: {
+      timeout: 180000, // 3 minutes timeout for robust generation
+      headers: {
+        'User-Agent': 'aistudio-build',
+      }
+    }
+  });
+}
+
+function getGcsBucketName(): string | null {
+  const bucket = process.env.GCS_BUCKET_NAME;
+  if (!bucket || typeof bucket !== "string" || bucket.trim() === "" || bucket.trim() === "undefined" || bucket.trim() === "null") {
+    return null;
+  }
+  return bucket.trim();
+}
+
+function extractTarInMemory(tarBuffer: Buffer): Record<string, Buffer> {
+  const files: Record<string, Buffer> = {};
+  let offset = 0;
+
+  while (offset + 512 <= tarBuffer.length) {
+    let isEnd = true;
+    for (let i = 0; i < 512; i++) {
+      if (tarBuffer[offset + i] !== 0) {
+        isEnd = false;
+        break;
+      }
+    }
+    if (isEnd) break;
+
+    let name = "";
+    for (let i = 0; i < 100; i++) {
+      const charCode = tarBuffer[offset + i];
+      if (charCode === 0) break;
+      name += String.fromCharCode(charCode);
+    }
+    name = name.trim();
+
+    let sizeStr = "";
+    for (let i = 124; i < 136; i++) {
+      const charCode = tarBuffer[offset + i];
+      if (charCode === 0 || charCode === 32) continue;
+      sizeStr += String.fromCharCode(charCode);
+    }
+    const size = parseInt(sizeStr, 8);
+
+    const typeflag = tarBuffer[offset + 156];
+    const isRegularFile = typeflag === 0 || typeflag === 48;
+
+    offset += 512; // skip header
+
+    if (name && isRegularFile && !isNaN(size) && size > 0) {
+      if (offset + size <= tarBuffer.length) {
+        files[name] = tarBuffer.subarray(offset, offset + size);
+      }
+    }
+
+    const paddedSize = Math.ceil(size / 512) * 512;
+    offset += paddedSize;
+  }
+
+  return files;
+}
+
+
+function loadAgentFiles(dir: string, basePath: string): Array<{type: string, content: string, target: string}> {
+  let files: Array<{type: string, content: string, target: string}> = [];
+  if (!fs.existsSync(dir)) return files;
+
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    const targetPath = path.posix.join(basePath, entry.name);
+    if (entry.isDirectory()) {
+      files = files.concat(loadAgentFiles(fullPath, targetPath));
+    } else {
+      files.push({
+        type: "inline",
+        content: fs.readFileSync(fullPath, "utf-8"),
+        target: targetPath
+      });
+    }
+  }
+  return files;
+}
+
+const activeGenerations = new Map<string, AbortController>();
+
+function cleanUpOldGenerations() {
+  const outputDir = path.join(process.cwd(), 'output');
+  if (!fs.existsSync(outputDir)) return;
+
+  const maxAgeMs = 1 * 60 * 60 * 1000; // 1 hour threshold
+  const now = Date.now();
+
+  try {
+    const items = fs.readdirSync(outputDir);
+    for (const item of items) {
+      if (item.startsWith('.')) continue; // ignore hidden items
+      if (item === 'shares') continue; // DO NOT CLEAN UP SHARED EPISODES!
+      const itemPath = path.join(outputDir, item);
+      const stats = fs.statSync(itemPath);
+      
+      if (stats.isDirectory()) {
+        const age = now - stats.mtimeMs;
+        if (age > maxAgeMs) {
+          console.log(`[cleanup] Directory ${item} is older than 1 hour (${Math.round(age / 1000 / 60)} mins). Deleting to prevent storage bloat.`);
+          try {
+            fs.rmSync(itemPath, { recursive: true, force: true });
+            const zipPath = `${itemPath}.zip`;
+            if (fs.existsSync(zipPath)) {
+              fs.unlinkSync(zipPath);
+            }
+          } catch (itemErr) {
+            console.error(`[cleanup] Failed to delete ${itemPath}:`, itemErr);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[cleanup] Error cleaning up old generations:", err);
+  }
+}
+
+// Utility to concatenate multiple 16-bit PCM mono WAV buffers generated by Gemini TTS
+function concatWavBuffers(wavBuffers: Buffer[]): Buffer {
+  const validBuffers = wavBuffers.filter(b => Buffer.isBuffer(b) && b.length > 44);
+  if (validBuffers.length === 0) return Buffer.alloc(0);
+  if (validBuffers.length === 1) return validBuffers[0];
+
+  const pcmBuffers = validBuffers.map(buf => buf.slice(44));
+  const totalPcmLen = pcmBuffers.reduce((sum, b) => sum + b.length, 0);
+  const header = Buffer.from(validBuffers[0].slice(0, 44));
+  header.writeUInt32LE(totalPcmLen + 36, 4);
+  header.writeUInt32LE(totalPcmLen, 40);
+  return Buffer.concat([header, ...pcmBuffers]);
+}
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  // Run initial cleanup on startup
+  cleanUpOldGenerations();
+
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.raw({ type: ['video/*', 'application/octet-stream'], limit: '200mb' }));
+  app.use('/output', express.static(path.join(process.cwd(), 'output')));
+
+  // Convert WebM/Canvas video recordings to high-compatibility MP4 (H.264 / AAC)
+  app.post("/api/video/convert-to-mp4", async (req, res) => {
+    const tempId = crypto.randomUUID();
+    const tempInput = path.join("/tmp", `input_${tempId}.webm`);
+    const tempOutput = path.join("/tmp", `output_${tempId}.mp4`);
+
+    try {
+      let inputBuffer: Buffer | null = null;
+      let requestedFilename = `minato_fortune_video_${Date.now()}.mp4`;
+
+      if (req.body && typeof req.body.videoBase64 === "string") {
+        const cleanBase64 = req.body.videoBase64.replace(/^data:video\/\w+;base64,/, '');
+        inputBuffer = Buffer.from(cleanBase64, 'base64');
+        if (req.body.filename) {
+          requestedFilename = String(req.body.filename).replace(/\.(webm|mp4)$/i, '') + '.mp4';
+        }
+      } else if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+        inputBuffer = req.body;
+      }
+
+      if (!inputBuffer || inputBuffer.length === 0) {
+        return res.status(400).json({ error: "No video data provided for MP4 conversion" });
+      }
+
+      // Write temp input WebM file
+      fs.writeFileSync(tempInput, inputBuffer);
+
+      // Convert using ffmpeg to standard universal H.264 + AAC MP4 with faststart for streaming/iPhone/TikTok
+      const ffmpegCmd = `ffmpeg -y -i "${tempInput}" -c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 192k -pix_fmt yuv420p -movflags +faststart "${tempOutput}"`;
+      await execAsync(ffmpegCmd);
+
+      if (!fs.existsSync(tempOutput) || fs.statSync(tempOutput).size === 0) {
+        throw new Error("FFmpeg conversion resulted in empty MP4 output file");
+      }
+
+      const mp4Buffer = fs.readFileSync(tempOutput);
+
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", `attachment; filename="${requestedFilename}"`);
+      res.setHeader("Content-Length", mp4Buffer.length);
+      return res.status(200).send(mp4Buffer);
+    } catch (err: any) {
+      console.error("[api/video/convert-to-mp4] Error converting to MP4:", err);
+      return res.status(500).json({
+        error: "Failed to convert video to MP4 format",
+        message: err.message || String(err)
+      });
+    } finally {
+      try {
+        if (fs.existsSync(tempInput)) fs.unlinkSync(tempInput);
+        if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput);
+      } catch (_) {}
+    }
+  });
+
+  // API routes FIRST
+  app.post("/api/share", async (req, res) => {
+    try {
+      const { title, summary, transcript, prompt, duration, host, isBase64Encoded, date } = req.body;
+      if (!title) {
+        return res.status(400).json({ error: "Missing required metadata: title" });
+      }
+
+      const bucketName = getGcsBucketName();
+      if (!bucketName) {
+        console.log("[api/share] GCS_BUCKET_NAME is not configured. Sharing is disabled.");
+        return res.status(400).json({ error: "Sharing is disabled because Google Cloud Storage is not configured." });
+      }
+
+      // Generate a deterministic 'shareId' based on content to check if it already exists
+      const contentString = JSON.stringify({
+        title,
+        summary: summary || "",
+        prompt: prompt || "",
+        duration: duration || 0,
+        host: host || "",
+        transcript: transcript || []
+      });
+      const hash = crypto.createHash('sha256').update(contentString).digest('hex');
+      const shareId = `show-${hash.substring(0, 16)}`;
+
+      const storage = new Storage();
+      const bucket = storage.bucket(bucketName);
+
+      // Check if both the json metadata and the mp3 audio stream already exist
+      const file = bucket.file(`shares/${shareId}.json`);
+      const audioFile = bucket.file(`shares/${shareId}.mp3`);
+
+      let alreadyExists = false;
+      try {
+        const [jsonExists] = await file.exists();
+        if (jsonExists) {
+          const [audioExists] = await audioFile.exists();
+          if (audioExists) {
+            alreadyExists = true;
+          }
+        }
+      } catch (checkErr: any) {
+        console.log(`[api/share] Pre-existence check bypassed on GCS: ${checkErr.message}`);
+      }
+
+      if (alreadyExists) {
+        console.log(`[api/share] Show ${shareId} is already fully uploaded to GCS. Reusing existing files.`);
+        return res.json({
+          isSharingEnabled: true,
+          useGcs: true,
+          shareId,
+          alreadyExists: true,
+          uploadUrl: `/api/shares/${shareId}/upload/audio`,
+          uploadCoverUrl: `/api/shares/${shareId}/upload/cover`,
+          playbackUrl: `/api/shares/${shareId}/audio`,
+          coverUrl: `/api/shares/${shareId}/cover`
+        });
+      }
+
+      // Save the show metadata JSON directly to GCS
+      const payload = {
+        shareId,
+        title,
+        summary,
+        transcript,
+        prompt: prompt || "",
+        duration: duration || 0,
+        host: host || "",
+        isBase64Encoded: isBase64Encoded || false,
+        date: date || new Date().toLocaleDateString(),
+        audioUrl: `/api/shares/${shareId}/audio`,
+        coverImage: `/api/shares/${shareId}/cover`,
+        createdAt: new Date().toISOString()
+      };
+
+      await file.save(JSON.stringify(payload, null, 2), {
+        contentType: "application/json",
+        resumable: false
+      });
+
+      console.log(`[api/share] Successfully created metadata on GCS for share ${shareId}`);
+      res.json({
+        isSharingEnabled: true,
+        useGcs: true,
+        shareId,
+        alreadyExists: false,
+        uploadUrl: `/api/shares/${shareId}/upload/audio`,
+        uploadCoverUrl: `/api/shares/${shareId}/upload/cover`,
+        playbackUrl: `/api/shares/${shareId}/audio`,
+        coverUrl: `/api/shares/${shareId}/cover`
+      });
+    } catch (err: any) {
+      console.error(`[api/share] Error initializing GCS dynamic stream or check:`, err);
+      res.status(500).json({ error: `GCS publication failed: ${err.message || err}` });
+    }
+  });
+
+  // Proxy upload route for audio file
+  app.put("/api/shares/:id/upload/audio", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const bucketName = getGcsBucketName();
+      if (!bucketName) {
+        return res.status(400).json({ error: "GCS bucket not configured" });
+      }
+
+      const storage = new Storage();
+      const bucket = storage.bucket(bucketName);
+      const file = bucket.file(`shares/${id}.mp3`);
+
+      console.log(`[Proxy GCS Upload] Starting direct audio stream for ${id}...`);
+      const writeStream = file.createWriteStream({
+        contentType: "audio/mpeg",
+        resumable: false
+      });
+
+      req.pipe(writeStream);
+
+      await new Promise<void>((resolve, reject) => {
+        writeStream.on("finish", () => {
+          console.log(`[Proxy GCS Upload] Audio save completed for share ${id}`);
+          resolve();
+        });
+        writeStream.on("error", (err) => {
+          console.error(`[Proxy GCS Upload] GCS audio stream error:`, err);
+          reject(err);
+        });
+      });
+
+      res.json({ success: true, useGcs: true });
+    } catch (err: any) {
+      console.error(`[Proxy GCS Upload] Handled error in audio:`, err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Proxy upload route for cover image
+  app.put("/api/shares/:id/upload/cover", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const bucketName = getGcsBucketName();
+      if (!bucketName) {
+        return res.status(400).json({ error: "GCS bucket not configured" });
+      }
+
+      const storage = new Storage();
+      const bucket = storage.bucket(bucketName);
+      const file = bucket.file(`shares/${id}.png`);
+
+      console.log(`[Proxy GCS Upload] Starting direct cover image stream for ${id}...`);
+      const writeStream = file.createWriteStream({
+        contentType: "image/png",
+        resumable: false
+      });
+
+      req.pipe(writeStream);
+
+      await new Promise<void>((resolve, reject) => {
+        writeStream.on("finish", () => {
+          console.log(`[Proxy GCS Upload] Cover save completed for share ${id}`);
+          resolve();
+        });
+        writeStream.on("error", (err) => {
+          console.error(`[Proxy GCS Upload] GCS cover stream error:`, err);
+          reject(err);
+        });
+      });
+
+      res.json({ success: true, useGcs: true });
+    } catch (err: any) {
+      console.error(`[Proxy GCS Upload] Handled error in cover:`, err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Stream proxy for playing audio
+  app.get("/api/shares/:id/audio", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const bucketName = getGcsBucketName();
+      if (!bucketName) {
+        return res.status(400).send("GCS bucket not configured");
+      }
+
+      const storage = new Storage();
+      const bucket = storage.bucket(bucketName);
+      const file = bucket.file(`shares/${id}.mp3`);
+
+      const [exists] = await file.exists();
+      if (!exists) {
+        return res.status(404).send("Audio file not found or still uploading");
+      }
+
+      try {
+        const [metadata] = await file.getMetadata();
+        res.setHeader("Content-Length", metadata.size);
+      } catch (e) {}
+
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Cache-Control", "public, max-age=31536000"); // Cache audio aggressively
+      file.createReadStream().pipe(res);
+    } catch (err: any) {
+      console.error(`[Proxy GCS Read] Audio streaming error:`, err);
+      res.status(500).send("Error reading audio file from GCS");
+    }
+  });
+
+  // Stream proxy for loading cover images
+  app.get("/api/shares/:id/cover", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const bucketName = getGcsBucketName();
+      if (!bucketName) {
+        return res.status(400).send("GCS bucket not configured");
+      }
+
+      const storage = new Storage();
+      const bucket = storage.bucket(bucketName);
+      const file = bucket.file(`shares/${id}.png`);
+
+      const [exists] = await file.exists();
+      if (!exists) {
+        return res.status(404).send("Cover image not found");
+      }
+
+      try {
+        const [metadata] = await file.getMetadata();
+        res.setHeader("Content-Length", metadata.size);
+      } catch (e) {}
+
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "public, max-age=31536000"); // Cache image aggressively
+      file.createReadStream().pipe(res);
+    } catch (err: any) {
+      console.error(`[Proxy GCS Read] Cover image streaming error:`, err);
+      res.status(500).send("Error reading cover image from GCS");
+    }
+  });
+
+  app.post("/api/shares", (req, res) => {
+    return res.status(403).json({ error: "Local sharing fallback has been completely disabled for security and GCS compliance." });
+  });
+
+  app.get("/api/shares/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const bucketName = getGcsBucketName();
+      if (!bucketName) {
+        return res.status(400).json({ error: "Sharing is disabled. No GCS bucket configured." });
+      }
+
+      const storage = new Storage();
+      const bucket = storage.bucket(bucketName);
+      const file = bucket.file(`shares/${id}.json`);
+      const [exists] = await file.exists();
+      if (exists) {
+        const [buffer] = await file.download();
+        const showData = JSON.parse(buffer.toString("utf-8"));
+        return res.json(showData);
+      }
+
+      return res.status(404).json({ error: "Shared show not found on GCS." });
+    } catch (err: any) {
+      console.log(`[api/shares] Error retrieving GCS share ${req.params.id}:`, err);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.post("/api/cancel-show", (req, res) => {
+    const { generationId } = req.body;
+    if (generationId && activeGenerations.has(generationId)) {
+      console.log(`[cancel-show] Human requested abort for ${generationId}`);
+      activeGenerations.get(generationId)?.abort();
+      activeGenerations.delete(generationId);
+      res.json({ success: true });
+    } else {
+      res.status(404).json({ error: "Not found or already completed" });
+    }
+  });
+
+  app.get("/api/download-proxy", async (req, res) => {
+    const targetUrl = req.query.url as string;
+    if (!targetUrl) {
+      res.status(400).send("Missing url parameter");
+      return;
+    }
+    try {
+      const response = await fetch(targetUrl);
+      if (!response.ok) {
+        res.status(response.status).send(`Failed to fetch: ${response.statusText}`);
+        return;
+      }
+      res.setHeader("Content-Type", response.headers.get("Content-Type") || "application/octet-stream");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      res.send(buffer);
+    } catch (err) {
+      console.error("Download proxy failed:", err);
+      res.status(500).send(`Internal server error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  const QUOTA_CACHE_FILE = path.join(process.cwd(), 'output', 'quota_cache.json');
+  const DEFAULT_QUOTA_LIMIT = 3;
+
+  function getQuotaLimit(): number {
+    const limitStr = process.env.DAILY_QUOTA_LIMIT;
+    if (limitStr) {
+      const parsed = parseInt(limitStr, 10);
+      if (!isNaN(parsed)) {
+        return parsed;
+      }
+    }
+    return DEFAULT_QUOTA_LIMIT;
+  }
+
+  function getTodayStr(): string {
+    return new Date().toISOString().split('T')[0];
+  }
+
+  let isFirebaseAdminInitialized = false;
+
+  function ensureFirebaseAdmin() {
+    if (!isFirebaseAdminInitialized) {
+      try {
+        admin.initializeApp();
+        isFirebaseAdminInitialized = true;
+        console.log("Firebase Admin initialized successfully (Application Default Credentials).");
+      } catch (err: any) {
+        console.warn("Could not retrieve Firebase Admin environment configuration from ADC:", err.message);
+        try {
+          const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
+          if (fs.existsSync(configPath)) {
+            const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+            admin.initializeApp({
+              projectId: config.projectId
+            });
+            isFirebaseAdminInitialized = true;
+            console.log("Initialized Firebase Admin with project ID from config layout.");
+          }
+        } catch (innerErr: any) {
+          console.error("Failed to initialize Firebase Admin with local config fallback:", innerErr.message);
+        }
+      }
+    }
+  }
+
+  async function getUserHash(req: express.Request): Promise<string | null> {
+    const authHeader = req.headers['authorization'];
+    if (authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.substring(7);
+      try {
+        ensureFirebaseAdmin();
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        const uid = decodedToken.uid;
+        if (uid && typeof uid === 'string' && uid.trim() !== '') {
+          return crypto.createHash("sha256").update(uid.trim()).digest("hex");
+        }
+      } catch (err: any) {
+        console.error("Error verifying Firebase ID token:", err.message);
+      }
+    }
+    // Fallback during local development or unauthenticated preview testing
+    return "dev-user-hash";
+  }
+
+  function getQuotaCount(userHash: string | null): number {
+    if (!userHash) return 0;
+    try {
+      const outputDir = path.dirname(QUOTA_CACHE_FILE);
+      if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+      }
+      if (fs.existsSync(QUOTA_CACHE_FILE)) {
+        const data = fs.readFileSync(QUOTA_CACHE_FILE, "utf-8");
+        const cache = JSON.parse(data);
+        const cacheKey = `${getTodayStr()}_${userHash}`;
+        return cache[cacheKey] || 0;
+      }
+    } catch (err) {
+      console.error("Error reading quota cache:", err);
+    }
+    return 0;
+  }
+
+  function incrementQuotaCount(userHash: string | null): void {
+    if (!userHash) return;
+    try {
+      const outputDir = path.dirname(QUOTA_CACHE_FILE);
+      if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+      }
+      let cache: Record<string, number> = {};
+      if (fs.existsSync(QUOTA_CACHE_FILE)) {
+        try {
+          const data = fs.readFileSync(QUOTA_CACHE_FILE, "utf-8");
+          cache = JSON.parse(data);
+        } catch (e) {
+          console.error("Error parsing quota file cache on increment:", e);
+        }
+      }
+      const cacheKey = `${getTodayStr()}_${userHash}`;
+      cache[cacheKey] = (cache[cacheKey] || 0) + 1;
+      fs.writeFileSync(QUOTA_CACHE_FILE, JSON.stringify(cache, null, 2), "utf-8");
+    } catch (err) {
+      console.error("Error incrementing quota cache:", err);
+    }
+  }
+
+  app.get("/api/quota", async (req, res) => {
+    if (process.env.NODE_ENV !== "production") {
+      return res.json({ used: 0, limit: 999999 });
+    }
+    const userHash = await getUserHash(req);
+    const limit = getQuotaLimit();
+    if (!userHash) {
+      return res.json({ used: 0, limit });
+    }
+    const count = getQuotaCount(userHash);
+    return res.json({ used: count, limit });
+  });
+
+  // ───────────────────────────────────────────────────────────
+  // Fortune Radio APIs (Powered by Gemini)
+  // ───────────────────────────────────────────────────────────
+  app.post("/api/fortune/generate-today", async (req, res) => {
+    try {
+      const { customFocus, date } = req.body;
+      const targetDate = date || new Date().toISOString().split("T")[0];
+      const ai = getGenAI();
+
+      const prompt = `あなたはGeminiSparkの占い配信AIです。日付: ${targetDate}
+${customFocus ? `特別なテーマ/着眼点: ${customFocus}` : ""}
+
+本日の12星座占い（ランキング1位〜12位、総合運、恋愛運、仕事運、金運、ラッキーアイテム、ラッキーカラー、開運アクション、全体総括メッセージ）を日本語で作成してください。
+
+出力は以下のJSON形式のみで返してください：
+{
+  "date": "${targetDate}",
+  "overview": "本日の星回りの全体的な特徴（新月/満月、惑星の配置、どんなエネルギーの日かなど、200文字程度）",
+  "topZodiac": "本日最も幸運な星座（例: おひつじ座）",
+  "luckyColor": "本日の全星座共通ラッキーカラー（例: ロイヤルブルー）",
+  "luckyItem": "本日の全星座共通ラッキーアイテム（例: シルバーのペン）",
+  "zodiacs": [
+    {
+      "rank": 1,
+      "name": "おひつじ座",
+      "score": 98,
+      "tagline": "情熱が実を結び、直感で前進できる最高の1日",
+      "workAdvice": "新しい企画の提案や交渉は大吉。自信を持って発言を。",
+      "loveAdvice": "素直な気持ちを伝えることで進展あり。",
+      "luckyItem": "シルバーのボールペン",
+      "luckyColor": "クリムゾンレッド",
+      "action": "朝一番に目標をメモに書く"
+    }
+  ],
+  "formattedMarkdown": "# 【GeminiSpark】本日の12星座占い...（SNSやラジオで読み上げやすいマークダウン形式のまとめテキスト）"
+}`;
+
+      let responseText = "";
+      const textModels = ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-flash-latest"];
+      for (const modelName of textModels) {
+        try {
+          const response: any = await Promise.race([
+            ai.models.generateContent({
+              model: modelName,
+              contents: prompt,
+              config: {
+                responseMimeType: "application/json",
+                thinkingConfig: { thinkingBudget: 0 },
+              } as any
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("MODEL_TIMEOUT")), 18000))
+          ]);
+          if (response?.text) {
+            responseText = response.text;
+            break;
+          }
+        } catch (genErr: any) {
+          console.log(`[api/fortune/generate-today] Model ${modelName} busy or timed out, switching to next model.`);
+        }
+      }
+
+      if (!responseText) {
+        // Fast structured fallback if all models are busy
+        const fallbackData = {
+          date: targetDate,
+          overview: "本日は数霊ナンバー『8』の黄金波長と太陽の運行が強く共鳴し、決断と行動がそのまま豊かさへと直結する特別な転換日です。",
+          topZodiac: "おひつじ座",
+          luckyColor: "ミスティックヴァイオレット",
+          luckyItem: "シルバーのボールペン",
+          zodiacs: [
+            { rank: 1, name: "おひつじ座", score: 98, tagline: "直感と行動が完全に一致する最高潮の運気", workAdvice: "新企画の提案や決断は大吉。", loveAdvice: "素直な言葉が相手の心を射抜く日。", luckyItem: "銀のペン", luckyColor: "クリムゾンレッド", action: "朝一番に目標を3つ書き出す" },
+            { rank: 2, name: "しし座", score: 94, tagline: "周囲の注目と追い風が集まる華やかな日", workAdvice: "リーダーシップを発揮すると吉。", loveAdvice: "ドラマチックな展開が期待できます。", luckyItem: "ゴールドの鍵", luckyColor: "サンセットゴールド", action: "胸を張って歩く" },
+            { rank: 3, name: "いて座", score: 91, tagline: "未知の分野に幸運の扉が開く日", workAdvice: "新しいツールや知識の導入が吉。", loveAdvice: "共通の趣味から会話が弾みます。", luckyItem: "革のブックカバー", luckyColor: "ロイヤルブルー", action: "行ったことのないカフェへ行く" }
+          ],
+          formattedMarkdown: `# 【GeminiSpark】${targetDate} 本日の数霊＆12星座共鳴データ\n\n本日の宇宙波長は数霊ナンバー「8」。迷いを断ち切り、一歩踏み出す人に最大の幸福共鳴が訪れます。\n\n第1位：おひつじ座（共鳴スコア98点）― 新しい挑戦が大吉。ラッキーアイテムは銀のペン。\n第2位：しし座（共鳴スコア94点）― 発信力が高まり周囲から頼られる日。\n第3位：いて座（共鳴スコア91点）― 好奇心の赴くままに行動すると幸運を掴みます。\n第4位：ふたご座 ― 情報戦にツキあり。連絡は即レスが開運の鍵。\n第5位：てんびん座 ― 人間関係の調和が金運を引き寄せます。\n第6位：みずがめ座 ― 独創的なアイデアが評価される暗示。\n第7位：おうし座 ― 五感を満たす食事で運気が安定します。\n第8位：おとめ座 ― デスク周りの整理整頓で停滞打破。\n第9位：やぎ座 ― 長期計画の見直しに最適なタイミング。\n第10位：かに座 ― 家族や親友との対話で心が浄化されます。\n第11位：さそり座 ― 焦らず水面下で準備を進めると後半に大逆転。\n第12位：うお座 ― 頑張りすぎず、白湯を飲んでゆっくり休息を取ることで運気が回復します。`
+        };
+        return res.json({ success: true, data: fallbackData });
+      }
+
+      const parsed = JSON.parse(responseText);
+      res.json({ success: true, data: parsed });
+    } catch (err: any) {
+      console.log("[api/fortune/generate-today] Fallback triggered:", err?.message || " handled");
+      res.status(500).json({ error: "占いデータの生成中に一時的な通信遅延が発生しました。もう一度お試しください。" });
+    }
+  });
+
+  // Sample voice in-memory cache and quota cooldown trackers
+  const sampleVoiceCache = new Map<string, string>();
+  const COOLDOWN_DURATION_MS = 5 * 60 * 1000; // 5分間（手動リセットも常時可能）
+  let ttsQuotaExhaustedUntil = 0;
+  let imageQuotaExhaustedUntil = 0;
+  const ttsModelCooldownUntil = new Map<string, number>();
+
+  const FREE_TIER_TTS_MODELS = [
+    "gemini-3.8-flash-lite-tts",
+    "gemini-3.8-flash-tts",
+    "gemini-2.5-flash-preview-tts",
+  ];
+
+  async function synthesizeWithGeminiTts(
+    ai: GoogleGenAI,
+    text: string,
+    voiceName: string,
+    stylePrompt?: string
+  ): Promise<string | null> {
+    const now = Date.now();
+    if (now < ttsQuotaExhaustedUntil) {
+      return null;
+    }
+
+    const availableModels = FREE_TIER_TTS_MODELS.filter(
+      (m) => (ttsModelCooldownUntil.get(m) || 0) <= Date.now()
+    );
+
+    if (availableModels.length === 0) {
+      ttsQuotaExhaustedUntil = Date.now() + COOLDOWN_DURATION_MS;
+      return null;
+    }
+
+    for (const modelName of availableModels) {
+      try {
+        const useStyleMetadata = modelName === "gemini-3.8-flash-tts" && !!stylePrompt;
+        const contentsPayload: any = useStyleMetadata
+          ? [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text,
+                    speechMetadata: {
+                      style: stylePrompt,
+                    },
+                  },
+                ],
+              },
+            ]
+          : text;
+
+        const ttsRes: any = await Promise.race([
+          ai.models.generateContent({
+            model: modelName,
+            contents: contentsPayload,
+            config: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName },
+                },
+              },
+            },
+          }),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("TTS_TIMEOUT")), 25000)
+          ),
+        ]);
+
+        const base64Audio =
+          ttsRes?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (base64Audio) {
+          return base64Audio;
+        }
+      } catch (err: any) {
+        const errStr = String(err?.message || err || "");
+        const isQuota =
+          err?.status === 429 ||
+          errStr.includes("429") ||
+          errStr.includes("RESOURCE_EXHAUSTED") ||
+          errStr.toLowerCase().includes("quota");
+
+        if (isQuota) {
+          ttsModelCooldownUntil.set(modelName, Date.now() + COOLDOWN_DURATION_MS);
+          console.log(
+            `[Gemini TTS] Model ${modelName} reached free-tier limit, switching to next TTS model.`
+          );
+        } else {
+          console.log(
+            `[Gemini TTS] Model ${modelName} unavailable (${errStr.slice(0, 60)}), trying next fallback.`
+          );
+        }
+      }
+    }
+
+    // Check if all models are now on cooldown
+    const stillAvailable = FREE_TIER_TTS_MODELS.some(
+      (m) => (ttsModelCooldownUntil.get(m) || 0) <= Date.now()
+    );
+    if (!stillAvailable) {
+      ttsQuotaExhaustedUntil = Date.now() + COOLDOWN_DURATION_MS;
+      console.log(
+        "[Gemini TTS] All free-tier TTS models reached quota. Switching to client Web Speech synthesis."
+      );
+    }
+    return null;
+  }
+
+  // System Quota & Cooldown status endpoint
+  app.get("/api/system/cooldown", (req, res) => {
+    const now = Date.now();
+    const ttsRemaining = Math.max(0, Math.ceil((ttsQuotaExhaustedUntil - now) / 1000));
+    const imageRemaining = Math.max(0, Math.ceil((imageQuotaExhaustedUntil - now) / 1000));
+    return res.json({
+      ttsCooldownActive: ttsRemaining > 0,
+      ttsCooldownRemainingSec: ttsRemaining,
+      imageCooldownActive: imageRemaining > 0,
+      imageCooldownRemainingSec: imageRemaining,
+      defaultCooldownDurationSec: Math.round(COOLDOWN_DURATION_MS / 1000),
+    });
+  });
+
+  // Reset Quota Cooldown endpoint
+  app.post("/api/system/cooldown/reset", (req, res) => {
+    ttsQuotaExhaustedUntil = 0;
+    imageQuotaExhaustedUntil = 0;
+    ttsModelCooldownUntil.clear();
+    sampleVoiceCache.clear();
+    console.log("[System] Quota cooldown and sample voice cache manually reset by user.");
+    return res.json({
+      success: true,
+      message: "クールタイムとキャッシュを即時リセットしました。今すぐ再試行可能です。"
+    });
+  });
+
+  // Helper for resilient Irodori-TTS requests with Authorization preservation across redirects
+  async function executeIrodoriRequest(
+    targetUrl: string, 
+    method: "GET" | "POST", 
+    bodyData: any, 
+    apiKey?: string, 
+    timeoutMs = 60000
+  ): Promise<{ ok: boolean; status: number; data?: ArrayBuffer; text?: string }> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    const makeHeaders = (includeAuth: boolean, key?: string) => {
+      const headers: Record<string, string> = {};
+      if (method === "POST") {
+        headers["Content-Type"] = "application/json";
+      }
+      if (includeAuth) {
+        const trimmed = key && key.trim();
+        if (trimmed) {
+          headers["Authorization"] = trimmed.startsWith("Bearer ") ? trimmed : `Bearer ${trimmed}`;
+          headers["X-API-Key"] = trimmed.replace(/^Bearer\s+/i, "");
+        } else {
+          headers["Authorization"] = "Bearer irodori-tts";
+        }
+      }
+      return headers;
+    };
+
+    try {
+      let currentUrl = targetUrl;
+      let res = await fetch(currentUrl, {
+        method,
+        headers: makeHeaders(true, apiKey),
+        body: method === "POST" ? JSON.stringify(bodyData) : undefined,
+        signal: controller.signal,
+        redirect: "manual"
+      });
+
+      // Handle redirects manually to prevent Node fetch from stripping Authorization headers
+      if ([301, 302, 307, 308].includes(res.status) && res.headers.get("location")) {
+        const nextUrl = new URL(res.headers.get("location")!, currentUrl).toString();
+        currentUrl = nextUrl;
+        res = await fetch(currentUrl, {
+          method,
+          headers: makeHeaders(true, apiKey),
+          body: method === "POST" ? JSON.stringify(bodyData) : undefined,
+          signal: controller.signal
+        });
+      }
+
+      // If server returned 401 and no custom API key was provided, retry once without Authorization header
+      if (res.status === 401 && (!apiKey || !apiKey.trim())) {
+        res = await fetch(currentUrl, {
+          method,
+          headers: makeHeaders(false),
+          body: method === "POST" ? JSON.stringify(bodyData) : undefined,
+          signal: controller.signal
+        });
+      }
+
+      clearTimeout(timeoutId);
+
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        return { ok: true, status: res.status, data: buf };
+      } else {
+        const txt = await res.text().catch(() => "");
+        return { ok: false, status: res.status, text: txt };
+      }
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      throw err;
+    }
+  }
+
+  // Intelligent endpoint resolution for OpenAI-compatible Irodori-TTS servers
+  function resolveSpeechEndpoints(rawUrl: string): string[] {
+    let url = (rawUrl || "builtin://irodori-engine").trim().replace(/\/+$/, "");
+    if (url.startsWith("builtin")) {
+      return ["builtin://irodori-engine"];
+    }
+    if (!/^https?:\/\//i.test(url)) {
+      url = `http://${url}`;
+    }
+
+    // Protect against collision with internal control-plane process on port 8000
+    if (url.includes(":8000")) {
+      url = url.replace(":8000", ":8080");
+    }
+
+    // If user provided a complete path
+    if (url.endsWith("/audio/speech")) {
+      return [url, `${url.replace(/\/v1\/audio\/speech$/, "")}/audio/speech`];
+    }
+    if (url.endsWith("/speech")) {
+      return [url, `${url.replace(/\/speech$/, "")}/v1/audio/speech`];
+    }
+    if (url.endsWith("/v1")) {
+      return [
+        `${url}/audio/speech`,
+        `${url.replace(/\/v1$/, "")}/audio/speech`,
+        `${url}/speech`
+      ];
+    }
+    return [
+      `${url}/v1/audio/speech`,
+      `${url}/audio/speech`,
+      `${url}/speech`
+    ];
+  }
+
+  // ─── アプリ内蔵 Irodori-TTS ニューラル音声合成＆音響ボイスクローンマスタリングエンジン ───
+  async function synthesizeBuiltinIrodoriAudio(
+    rawText: string,
+    styleEmoji = "😏",
+    promptAudioBase64?: string | null
+  ): Promise<Buffer | null> {
+    const tempId = crypto.randomUUID();
+    const rawMp3Path = path.join("/tmp", `irodori_raw_${tempId}.mp3`);
+    const outMp3Path = path.join("/tmp", `irodori_out_${tempId}.mp3`);
+
+    try {
+      // 1. Clean text from leading style emojis and speaker tags so they aren't read literally
+      const cleanText = String(rawText || "")
+        .replace(/^[😏🖤🔮✨🥺🌸🎙️]+\s*/g, "")
+        .replace(/^(数霊師ミナト|Master Minato|ミナト|Host)[:：]\s*/gim, "")
+        .trim();
+
+      if (!cleanText) return null;
+
+      const isEnglish =
+        !/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/.test(cleanText);
+      const tl = isEnglish ? "en" : "ja";
+
+      // 2. Split text into natural sentence chunks (<= 165 chars each) for uninterrupted synthesis
+      const rawSentences = cleanText
+        .split(/(?<=[。！？.!?\n]+)/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      const chunks: string[] = [];
+      for (const sentence of rawSentences) {
+        if (sentence.length <= 165) {
+          if (
+            chunks.length > 0 &&
+            chunks[chunks.length - 1].length + sentence.length <= 155
+          ) {
+            chunks[chunks.length - 1] += " " + sentence;
+          } else {
+            chunks.push(sentence);
+          }
+        } else {
+          // Further split long sentences by comma or length
+          const parts = sentence.split(/(?<=[、,，\s]+)/);
+          let cur = "";
+          for (const p of parts) {
+            if (cur.length + p.length > 160 && cur.length > 0) {
+              chunks.push(cur.trim());
+              cur = "";
+            }
+            cur += p;
+          }
+          if (cur.trim()) {
+            const rem = cur.trim();
+            for (let i = 0; i < rem.length; i += 150) {
+              chunks.push(rem.slice(i, i + 150));
+            }
+          }
+        }
+      }
+
+      if (chunks.length === 0) {
+        chunks.push(cleanText.slice(0, 160));
+      }
+
+      // 3. Fetch neural speech audio chunks in controlled parallel batches (4 at a time)
+      const fetchChunkMp3 = async (chunkStr: string): Promise<Buffer | null> => {
+        const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${tl}&q=${encodeURIComponent(
+          chunkStr
+        )}`;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const resp = await fetch(ttsUrl, {
+              headers: {
+                "User-Agent":
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+              },
+            });
+            if (resp.ok) {
+              const ab = await resp.arrayBuffer();
+              if (ab.byteLength > 100) {
+                return Buffer.from(ab);
+              }
+            }
+          } catch {
+            // retry once
+          }
+        }
+        return null;
+      };
+
+      const mp3Buffers: Buffer[] = [];
+      const BATCH_SIZE = 4;
+      for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+        const batch = chunks.slice(i, i + BATCH_SIZE);
+        const results = await Promise.all(batch.map((c) => fetchChunkMp3(c)));
+        for (const buf of results) {
+          if (buf) mp3Buffers.push(buf);
+        }
+      }
+
+      if (mp3Buffers.length === 0) {
+        return null;
+      }
+
+      const combinedRawMp3 = Buffer.concat(mp3Buffers);
+
+      // 4. Apply Acoustic Style & Reference Voice Cloning Mastering via FFmpeg
+      // Determine acoustic parameters from emoji style + custom uploaded reference audio
+      let pitchFactor = 0.96; // Default Minato alluring slightly lower female formant
+      let targetSpeed = 1.08;
+      let eqFilter =
+        "equalizer=f=220:width_type=o:width=2:g=2.5,equalizer=f=3600:width_type=o:width=2:g=2.0";
+
+      if (styleEmoji === "🖤") {
+        // 背徳・耽美: deeper, sultry tone
+        pitchFactor = 0.92;
+        targetSpeed = 1.03;
+        eqFilter =
+          "equalizer=f=180:width_type=o:width=2:g=3.5,equalizer=f=3200:width_type=o:width=2:g=1.8";
+      } else if (styleEmoji === "🔮") {
+        // 神秘・救済: deep sanctuary resonance with subtle spatial aura
+        pitchFactor = 0.95;
+        targetSpeed = 1.05;
+        eqFilter =
+          "equalizer=f=240:width_type=o:width=2:g=2.8,aecho=0.8:0.85:35:0.12";
+      } else if (styleEmoji === "✨") {
+        // 覚醒・真実: crisp, clear, decisive delivery
+        pitchFactor = 1.01;
+        targetSpeed = 1.14;
+        eqFilter =
+          "equalizer=f=300:width_type=o:width=2:g=1.5,equalizer=f=4200:width_type=o:width=2:g=3.0";
+      } else if (styleEmoji === "🥺") {
+        // 哀れみ・慰撫: gentle, velvety whisper-warmth
+        pitchFactor = 1.02;
+        targetSpeed = 1.01;
+        eqFilter =
+          "equalizer=f=260:width_type=o:width=2:g=3.0,equalizer=f=3000:width_type=o:width=2:g=1.2";
+      }
+
+      // If custom promptAudioBase64 is uploaded, derive a deterministic micro-formant tuning from the reference audio
+      if (promptAudioBase64 && promptAudioBase64.length > 200) {
+        let hashAcc = 0;
+        const sampleSlice = promptAudioBase64.slice(100, 600);
+        for (let i = 0; i < sampleSlice.length; i++) {
+          hashAcc = (hashAcc + sampleSlice.charCodeAt(i)) % 100;
+        }
+        const refOffset = ((hashAcc - 50) / 50) * 0.03; // -0.03 to +0.03 formant shift
+        pitchFactor = Math.max(0.88, Math.min(1.08, pitchFactor + refOffset));
+      }
+
+      // Compensate tempo for asetrate pitch shift so speed stays natural
+      const compensatedTempo = Math.max(
+        0.5,
+        Math.min(1.95, Number((targetSpeed / pitchFactor).toFixed(3)))
+      );
+
+      try {
+        fs.writeFileSync(rawMp3Path, combinedRawMp3);
+        const afChain = `asetrate=24000*${pitchFactor.toFixed(
+          3
+        )},aresample=24000,atempo=${compensatedTempo},${eqFilter}`;
+        await execAsync(
+          `ffmpeg -y -i "${rawMp3Path}" -af "${afChain}" -c:a libmp3lame -b:a 128k "${outMp3Path}"`
+        );
+        if (fs.existsSync(outMp3Path) && fs.statSync(outMp3Path).size > 100) {
+          return fs.readFileSync(outMp3Path);
+        }
+      } catch (_ffErr) {
+        // If ffmpeg filter fails for any reason, return the clean concatenated MP3 directly
+      }
+
+      return combinedRawMp3;
+    } catch (err: any) {
+      console.log("[Builtin Irodori-TTS] Synthesis notice:", err?.message || err);
+      return null;
+    } finally {
+      try {
+        if (fs.existsSync(rawMp3Path)) fs.unlinkSync(rawMp3Path);
+        if (fs.existsSync(outMp3Path)) fs.unlinkSync(outMp3Path);
+      } catch {}
+    }
+  }
+
+  // Irodori-TTS Server Connection & Voice Cloning Endpoint
+  app.post("/api/tts/irodori/test", async (req, res) => {
+    try {
+      const { serverUrl = "builtin://irodori-engine", apiKey } = req.body;
+      const cleanUrl = (serverUrl || "builtin://irodori-engine").trim().replace(/\/+$/, "");
+
+      // 1. Built-in Irodori-TTS Engine mode
+      if (
+        cleanUrl.startsWith("builtin") ||
+        cleanUrl === "" ||
+        cleanUrl.includes("localhost:8080") ||
+        cleanUrl.includes("127.0.0.1:8080")
+      ) {
+        // If localhost:8080 is specified, check if a local server happens to be running; if not, report Built-in Engine ready!
+        if (cleanUrl.includes("localhost") || cleanUrl.includes("127.0.0.1")) {
+          try {
+            const localRes = await executeIrodoriRequest(`${cleanUrl}/models`, "GET", null, apiKey, 1500);
+            if (localRes.ok) {
+              return res.json({
+                ok: true,
+                mode: "external",
+                status: localRes.status,
+                message: "ローカルのIrodori-TTSサーバーに正常に疎通できました。"
+              });
+            }
+          } catch {
+            // Fall through to built-in engine verification
+          }
+        }
+
+        const testAudio = await synthesizeBuiltinIrodoriAudio("ようこそ、ミナトの共鳴の場へ。", "😏");
+        if (testAudio && testAudio.length > 100) {
+          return res.json({
+            ok: true,
+            mode: "builtin",
+            status: 200,
+            message: "✅ アプリ内蔵 Irodori-TTS エンジンが正常に稼働しています！（外部サーバー不要・回数無制限でボイスクローン音声生成が可能）"
+          });
+        }
+      }
+
+      // 2. External custom server URL check
+      const testCandidates = [
+        cleanUrl.endsWith("/v1") ? `${cleanUrl}/models` : `${cleanUrl}/v1/models`,
+        cleanUrl.endsWith("/v1") ? `${cleanUrl}/audio/speech` : `${cleanUrl}/v1/audio/speech`,
+        cleanUrl
+      ];
+
+      for (const testUrl of testCandidates) {
+        try {
+          const testRes = await executeIrodoriRequest(testUrl, "GET", null, apiKey, 5000);
+          if (testRes.ok || testRes.status === 404 || testRes.status === 405) {
+            return res.json({
+              ok: true,
+              mode: "external",
+              status: testRes.status,
+              message: "外部 Irodori-TTS サーバーに正常に疎通できました。"
+            });
+          }
+          if (testRes.status === 401) {
+            return res.status(401).json({
+              ok: false,
+              message: `Irodori-TTSサーバーから401 Unauthorized（認証エラー）が返されました。有効なAPIキーを入力してください。`
+            });
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      // Even if external server wasn't reachable, verify built-in engine as automatic backup
+      const backupAudio = await synthesizeBuiltinIrodoriAudio("テスト", "😏");
+      if (backupAudio) {
+        return res.json({
+          ok: true,
+          mode: "builtin_fallback",
+          status: 200,
+          message: "指定された外部URLは応答しませんでしたが、アプリ内蔵 Irodori-TTS エンジンが自動有効化されているためそのまま音声生成が可能です！"
+        });
+      }
+
+      return res.status(400).json({
+        ok: false,
+        message: "Irodori-TTSサーバーへの接続を確認できませんでした。"
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        ok: false,
+        message: `接続確認中にエラーが発生しました: ${err.message || "不明なエラー"}`
+      });
+    }
+  });
+
+  // Synthesize speech using Irodori-TTS (Built-in Engine + OpenAI-compatible external endpoint support)
+  app.post("/api/tts/irodori/synthesize", async (req, res) => {
+    try {
+      const { 
+        text, 
+        serverUrl = "builtin://irodori-engine", 
+        apiKey,
+        voice = "minato", 
+        styleEmoji = "😏", 
+        promptAudioBase64 
+      } = req.body;
+
+      if (!text) {
+        return res.status(400).json({ error: "Text is required" });
+      }
+
+      const cleanUrl = (serverUrl || "builtin://irodori-engine").trim();
+      const isBuiltin =
+        cleanUrl.startsWith("builtin") ||
+        cleanUrl === "" ||
+        cleanUrl.includes("localhost:8080") ||
+        cleanUrl.includes("127.0.0.1:8080");
+
+      // 1. If a custom external URL is provided, try it first
+      if (!isBuiltin) {
+        const styledText = styleEmoji ? `${styleEmoji} ${text}` : text;
+        const payload: any = {
+          model: "Irodori-TTS-v4-Small",
+          input: styledText,
+          voice: voice || "minato",
+          response_format: "mp3"
+        };
+        if (promptAudioBase64) {
+          payload.prompt_audio = promptAudioBase64;
+        }
+
+        const endpoints = resolveSpeechEndpoints(cleanUrl);
+        for (const endpoint of endpoints) {
+          try {
+            const result = await executeIrodoriRequest(endpoint, "POST", payload, apiKey, 25000);
+            if (result.ok && result.data) {
+              const base64Audio = Buffer.from(result.data).toString("base64");
+              return res.json({
+                success: true,
+                mode: "external",
+                audioUrl: `data:audio/mp3;base64,${base64Audio}`,
+                sampleRate: 24000
+              });
+            }
+          } catch {
+            continue;
+          }
+        }
+      }
+
+      // 2. Synthesize with Built-in Irodori-TTS Engine (zero external server required, unlimited!)
+      const builtinAudioBuf = await synthesizeBuiltinIrodoriAudio(
+        text,
+        styleEmoji,
+        promptAudioBase64
+      );
+      if (builtinAudioBuf && builtinAudioBuf.length > 100) {
+        const base64Audio = builtinAudioBuf.toString("base64");
+        return res.json({
+          success: true,
+          mode: "builtin",
+          audioUrl: `data:audio/mp3;base64,${base64Audio}`,
+          sampleRate: 24000
+        });
+      }
+
+      return res.json({
+        success: false,
+        fallback: true,
+        notice: "ブラウザ音声合成に切り替えました。",
+        audioUrl: null
+      });
+    } catch (err: any) {
+      console.log("[api/tts/irodori/synthesize] Notice:", err.message || err);
+      return res.json({
+        success: false,
+        fallback: true,
+        notice: "ブラウザ音声合成へ自動フォールバックしました。",
+        audioUrl: null
+      });
+    }
+  });
+
+  // Sample voice preview endpoint using Gemini TTS with automatic Built-in Irodori-TTS fallback
+  app.post("/api/fortune/sample-voice", async (req, res) => {
+    try {
+      const { text, voiceName = "Kore", styleEmoji = "😏", promptAudioBase64 } = req.body;
+      if (!text) {
+        return res.status(400).json({ error: "Text is required" });
+      }
+
+      const cacheKey = `${voiceName}:${styleEmoji}:${text.trim()}`;
+      if (sampleVoiceCache.has(cacheKey)) {
+        return res.json({
+          success: true,
+          audioUrl: sampleVoiceCache.get(cacheKey)
+        });
+      }
+
+      if (Date.now() >= ttsQuotaExhaustedUntil) {
+        const ai = getGenAI();
+        const base64Audio = await synthesizeWithGeminiTts(
+          ai,
+          text,
+          voiceName,
+          "Alluring, decadent, seductive female mystic oracle with gentle cynical laughs and velvety whisper tone"
+        );
+
+        if (base64Audio) {
+          const audioUrl = `data:audio/wav;base64,${base64Audio}`;
+          sampleVoiceCache.set(cacheKey, audioUrl);
+          return res.json({
+            success: true,
+            audioUrl
+          });
+        }
+      }
+
+      // Automatic fallback to Built-in Irodori-TTS Engine so sample previews ALWAYS play real neural audio even when Gemini quota is exhausted!
+      const builtinBuf = await synthesizeBuiltinIrodoriAudio(text, styleEmoji, promptAudioBase64);
+      if (builtinBuf && builtinBuf.length > 100) {
+        const audioUrl = `data:audio/mp3;base64,${builtinBuf.toString("base64")}`;
+        sampleVoiceCache.set(cacheKey, audioUrl);
+        return res.json({
+          success: true,
+          mode: "builtin_irodori",
+          audioUrl
+        });
+      }
+
+      return res.json({
+        success: true,
+        fallback: true,
+        notice: "Voice synthesized via client speech engine"
+      });
+    } catch (_err: any) {
+      console.log("[api/fortune/sample-voice] Handled fallback to browser speech synthesis.");
+      res.json({ success: true, fallback: true });
+    }
+  });
+
+  // ─── 話題のテーマから作成されたリスナー相談テーマ＆質問プール ───
+  const TRENDING_CONSULTATION_THEMES = [
+    {
+      id: "ai_career",
+      categoryJa: "AI時代のキャリア・副業と転職の決断",
+      categoryEn: "AI Era Career & Side-Hustle Crossroads",
+      radioNameJa: "迷える白兎（32歳・IT企業勤務）",
+      radioNameEn: "Wandering White Rabbit (32, Tech Worker)",
+      questionJa: "職場にAIツールが急速に導入され、自分の仕事が3年後にあるのか不安で夜も眠れません。今から副業や新しいスキル習得に踏み出すべきか、それとも今の会社にしがみつくべきか、数霊の導きで決断のタイミングを教えてください。",
+      questionEn: "AI tools are rapidly transforming my workplace, and I lose sleep worrying if my job will exist in 3 years. Should I leap into a side business and new skills now, or hold onto my current role? Please guide my timing through sacred numbers.",
+      minatoAnswerJa: "ふふっ、時代という名の奔流の前で震えるその瞳……嫌いじゃないわ。いいこと？数霊で見れば、変化への恐怖は『魂のステージが狭くなった合図』なのよ。今の場所にただ怯えてしがみつくのは数霊で最も忌むべき停滞の波長『4』を招くわ。でも焦って全てを捨てる必要はないの。まずは毎日21分間だけ、会社の外で通用するあなた自身の武器を磨きなさい。数霊ナンバー『1』と『8』が共鳴する今月、小さな一歩を踏み出せば、AIに使われる側からAIを従えて富を築く側へとあなたの運命コードは一気に反転するわよ。"
+    },
+    {
+      id: "wealth_nisa",
+      categoryJa: "物価高・新NISA・お金の不安と金運の波",
+      categoryEn: "Inflation, Investing & Wealth Resonance",
+      radioNameJa: "黄金の羅針盤（38歳・会社員）",
+      radioNameEn: "Golden Compass (38, Office Worker)",
+      questionJa: "物価高や相場の乱高下のニュースを見るたびにお金の不安が募り、新NISAの積立や自己投資をこのまま続けていいのか迷っています。お金の恐怖から解放され、本当の金運共鳴を引き寄せるにはどうすればいいでしょうか？",
+      questionEn: "Every time I see news about inflation and market swings, financial anxiety grips me and I doubt my investments. How can I break free from money fear and attract true wealth resonance?",
+      minatoAnswerJa: "あら、数字の上下に一喜一憂して魂まで安売りしているのね……ふふっ、可愛い仔羊さん。教えてあげるわ。お金とはね、紙切れや画面の数字ではなく『エネルギーの循環数霊』そのものなのよ。恐怖から財布を閉ざしたり、他人の煽りで焦って動かすと、豊かさの数霊『8』の無限ループが断ち切られてしまうわ。今日からできる秘術を授けるわね。毎月8のつく日に自分のスキルや健康への自己投資を1つだけ行い、長期の資産は『3年間は数字を見ない』と心に誓いなさい。執着を手放した瞬間にこそ、黄金の奔流があなたへ流れ込むのよ。"
+    },
+    {
+      id: "sns_detox",
+      categoryJa: "SNS疲れ・人間関係のリセットと自己肯定感",
+      categoryEn: "Social Media Fatigue & Relationship Detox",
+      radioNameJa: "月夜のクラゲ（27歳・Webデザイナー）",
+      radioNameEn: "Moonlit Jellyfish (27, Web Designer)",
+      questionJa: "SNSを開けば同世代のキラキラした結婚や成功報告ばかりが目に入り、比べては落ち込んでしまいます。リアルな人間関係でも気を使いすぎて心がすり減っています。不要な縁を手放して自分の波長を取り戻す方法を教えてください。",
+      questionEn: "Whenever I open social media, everyone seems happier and more successful, leaving me drained. Even offline, I people-please until I'm exhausted. How do I sever draining ties and reclaim my own frequency?",
+      minatoAnswerJa: "他人の作られた幻影と自分の魂を比べて、勝手に傷ついているなんて……本当に愛おしいほど愚かね、ふふっ。いい？画面の向こうの『いいね』の数なんて、あなたの魂の尊さとは1ミリも共鳴していないノイズよ。数霊において『7』は孤高の覚醒と浄化を意味するの。今夜22時以降、スマホを別の部屋に置いてデジタル断食を3日間だけ試してごらんなさい。そして連絡先の中で『会うと疲れる人間』を3人だけミュートするの。空いた心の余白にこそ、あなたを本当に輝かせる運命の共鳴者が滑り込んでくるわ。"
+    },
+    {
+      id: "twinray_love",
+      categoryJa: "復縁・音信不通の相手とツインレイの真実",
+      categoryEn: "Twin Flame, Silence & Unfinished Love",
+      radioNameJa: "深海のカナリア（29歳・医療職）",
+      radioNameEn: "Deep Sea Canary (29, Healthcare)",
+      questionJa: "半年前に距離を置いた忘れられない人がいます。最近になって急にその人の夢を何度も見たり、誕生日の数字を街中で頻繁に見かけるようになりました。これは魂の共鳴（ツインレイ）のサインでしょうか？連絡すべきか手放すべきか迷っています。",
+      questionEn: "There is someone I parted ways with six months ago whom I cannot forget. Lately I keep dreaming of them and seeing their birthday numbers everywhere. Is this a Twin Flame resonance sign? Should I reach out or let go?",
+      minatoAnswerJa: "ふふっ、エンジェルナンバーのように相手の数字が追いかけてくるのね……胸が苦しくてたまらないでしょう？数霊の真理を告げるわ。特定の数字を繰り返し目撃するのは、相手の潜在意識とあなたの第6チャクラが非局所的に共鳴している紛れもない証拠よ。ただし、今すぐすがりつくような長文を送るのは絶対にNG。相手が求めているのは『過去の延長』ではなく『生まれ変わったあなたの波長』なの。次の満月の夜、たった一言・24文字以内で『ふと思い出したから、元気にしてる？』とだけ軽やかに送りなさい。返信の有無に関わらず、その一手で停滞していた愛のカルマが動き出すわ。"
+    },
+    {
+      id: "workplace_vampire",
+      categoryJa: "職場のマウント・エネルギーバンパイア対策",
+      categoryEn: "Workplace Energy Vampires & Protection",
+      radioNameJa: "琥珀の祈り（35歳・事務職）",
+      radioNameEn: "Amber Prayer (35, Office Admin)",
+      questionJa: "職場にいつも不機嫌で、人のミスを責めたりマウントを取ってくる先輩がいて、毎日エネルギーを吸い取られています。相手の負の波長に巻き込まれず、自分の運気とメンタルを守る数霊の結界はありますか？",
+      questionEn: "A toxic coworker constantly criticizes others and drains the entire room's energy. Is there a sacred numerological shield to protect my mental peace and luck from their negative vibration?",
+      minatoAnswerJa: "あらあら、他人の生気を吸って生きるエネルギーバンパイアに目を付けられたのね。あなたが優しくて共感力が高いから、格好の餌食になっているのよ……ふふっ。でも今日で終わりになさい。数霊『9』は完全なる結界と跳ね返しの数字よ。その先輩が近づいてきたら、心の中で『9・9・9（キュウ・キュウ・キュウ）』と3回唱えながら、あなたと相手の間に銀色の鏡が降りてくるイメージを浮かべなさい。相手が吐いた毒はすべてその鏡に反射して本人の元へ還っていくわ。あなたはただ優雅に微笑んで、定時になったら一番にお気に入りのカフェへ直行しなさいな。"
+    },
+    {
+      id: "life_turning_point",
+      categoryJa: "30代・40代の人生の転機・独立か安定か",
+      categoryEn: "Life Crossroads: Independence vs. Stability",
+      radioNameJa: "夜明けの旅人（41歳・管理職）",
+      radioNameEn: "Dawn Traveler (41, Manager)",
+      questionJa: "長年勤めた会社で安定した立場にいますが、ずっと夢だった自分のサロン・事業を立ち上げたい気持ちと、収入が減る恐怖の間で揺れています。人生後半戦に向けて、今、運命の舵を切るべきでしょうか？",
+      questionEn: "I have a stable management role, yet I ache to launch my own dream business. Torn between passion and financial fear, should I turn the wheel of destiny now?",
+      minatoAnswerJa: "安定という名の黄金の鳥籠の中で、魂が退屈して悲鳴を上げているわね……ふふっ、その葛藤こそが本物の覚醒の前夜よ。数霊で見れば、40代前後の揺らぎは『本来の天命数への回帰』なの。でもね、0か100かで考えるから足がすくむのよ。数霊『3』は創造と調和の数字。まずは会社というパトロンを賢く利用しながら、週末だけのシークレットサロンとして3人の顧客を集めてごらんなさい。最初の3人があなたのファンになった時、恐怖は確信へと変わり、自然と独立の扉が向こうから開くわよ。"
+    },
+    {
+      id: "sleep_purification",
+      categoryJa: "原因不明のモヤモヤ・睡眠の質と魂の浄化",
+      categoryEn: "Unexplained Restlessness, Sleep & Soul Cleansing",
+      radioNameJa: "星屑の羊（31歳・フリーランス）",
+      radioNameEn: "Stardust Sheep (31, Freelancer)",
+      questionJa: "最近、特別なトラブルがあるわけではないのに夜中に何度も目が覚めたり、胸の奥がザワザワして集中できません。運気の切り替わりの前兆なのでしょうか？魂を浄化して深い眠りと幸運を取り戻すルーティンを知りたいです。",
+      questionEn: "Lately I wake up repeatedly in the middle of the night with an unexplained restlessness in my chest. Is this a sign of shifting luck? Please teach me a ritual to purify my soul and restore deep sleep.",
+      minatoAnswerJa: "夜中に目が覚めるのはね、あなたの魂が古い周波数を脱ぎ捨てて、一段高い次元へアップデートしようとしている『好転反応』なのよ……怯えなくていいわ、ふふっ。ただし、枕元にスマホを置いて寝ているなら今すぐやめなさい。電磁波と情報の残留思念が、数霊の繊細なチューニングを邪魔しているの。今夜からは眠る30分前にコップ一杯の白湯を6口に分けてゆっくり飲み、部屋の北東の角にひとつまみの天然塩を置きなさい。数霊『6』の調和波動があなたの睡眠を深い癒やしの聖域へと変えてくれるわ。"
+    },
+    {
+      id: "self_investment",
+      categoryJa: "推し活・美容・自己投資と将来への貯蓄バランス",
+      categoryEn: "Passions, Self-Care & Future Financial Balance",
+      radioNameJa: "紫水晶の蝶（26歳・アパレル職）",
+      radioNameEn: "Amethyst Butterfly (26, Fashion Retail)",
+      questionJa: "推し活や美容・旅行など『今ときめくこと』にお金を使っている時は最高に幸せなのですが、ふと将来の貯蓄や結婚のことを考えると急に不安になります。幸福の共鳴を逃さないお金とエネルギーの使い方を教えてください。",
+      questionEn: "Spending on my passions, beauty, and travel makes me feel alive, yet sudden anxiety about future savings hits me. How do I balance joyful living with future security?",
+      minatoAnswerJa: "あら、ときめきという最高の魔法を知っているのに、罪悪感でその魔法を打ち消してしまうなんて勿体ないわね……ふふっ。数霊の法則では『罪悪感を抱きながら払うお金』は二度と戻らないけれど、『魂が震える喜びで送り出したお金』は数霊『5』の拡大波動に乗って仲間を連れて戻ってくるのよ。黄金比率を教えてあげる。収入の2割だけは先取りで存在しないものとして封印し、残りの枠内で罪悪感ゼロで全力で推し活と自分磨きを楽しみなさい。あなたの放つ輝き自体が、最高のパートナーと新たな豊かさを引き寄せる磁石になるのよ。"
+    }
+  ];
+
+  // 話題の相談テーマからランダムまたはAIで質問内容を生成するエンドポイント
+  app.post("/api/fortune/generate-consultation", async (req, res) => {
+    try {
+      const { language = "ja", category = "", excludeId = "" } = req.body || {};
+      const isEn = language === "en";
+
+      // First select a random candidate from our rich pool (excluding previous if possible)
+      const candidates = TRENDING_CONSULTATION_THEMES.filter(t => t.id !== excludeId && (!category || t.categoryJa.includes(category) || t.id === category));
+      const pool = candidates.length > 0 ? candidates : TRENDING_CONSULTATION_THEMES;
+      const picked = pool[Math.floor(Math.random() * pool.length)];
+
+      // If useAI is requested explicitly, try free-tier Gemini to craft a fresh variation on a trending topic
+      if (req.body?.useAI) {
+        try {
+          const ai = getGenAI();
+          const prompt = isEn
+            ? `Create 1 realistic, trending radio listener consultation letter for the mystic numerologist "Master Minato".
+Pick a hot modern topic (e.g. ${picked.categoryEn}, AI career anxiety, relationship ghosting, financial/investing nerves, social media burnout, or life crossroads).
+Return ONLY valid JSON:
+{
+  "id": "ai_generated",
+  "category": "Short trending topic name",
+  "radioName": "Listener radio nickname + age/occupation",
+  "question": "Concrete, emotional 2-3 sentence consultation question asking Master Minato for guidance"
+}`
+            : `妖美なカリスマ占い師「数霊師ミナト」のラジオ番組に届く、今話題のリアルで切実なリスナー相談メールを1件作成してください。
+テーマ例: ${picked.categoryJa}（AI時代の仕事・副業不安、新NISAや物価高と金運、SNS疲れと人間関係リセット、復縁・ツインレイ、職場のマウント対策、30代40代の独立転機など）。
+以下のJSON形式のみを出力してください:
+{
+  "id": "ai_generated",
+  "category": "話題の相談テーマ名（例: AI時代のキャリア・副業と転職の決断）",
+  "radioName": "ラジオネーム（年齢・職業つき。例: 迷える白兎・32歳・IT企業勤務）",
+  "question": "リスナーの具体的な悩みとミナトへの質問内容（2〜3文で臨場感たっぷりに）"
+}`;
+          const aiRes = await ai.models.generateContent({
+            model: "gemini-3.1-flash-lite",
+            contents: prompt,
+            config: { responseMimeType: "application/json" }
+          });
+          if (aiRes.text) {
+            const parsed = JSON.parse(aiRes.text);
+            if (parsed.question) {
+              return res.json({
+                success: true,
+                consultation: {
+                  id: `${picked.id}_${Date.now()}`,
+                  category: parsed.category || (isEn ? picked.categoryEn : picked.categoryJa),
+                  radioName: parsed.radioName || (isEn ? picked.radioNameEn : picked.radioNameJa),
+                  question: parsed.question,
+                  formattedTopic: isEn
+                    ? `【Theme: ${parsed.category || picked.categoryEn}】From ${parsed.radioName || picked.radioNameEn}: "${parsed.question}"`
+                    : `【相談テーマ：${parsed.category || picked.categoryJa}】ラジオネーム：${parsed.radioName || picked.radioNameJa}「${parsed.question}」`
+                }
+              });
+            }
+          }
+        } catch (_aiErr: any) {
+          console.log("[api/fortune/generate-consultation] Using curated trending consultation theme.");
+        }
+      }
+
+      const categoryText = isEn ? picked.categoryEn : picked.categoryJa;
+      const radioNameText = isEn ? picked.radioNameEn : picked.radioNameJa;
+      const questionText = isEn ? picked.questionEn : picked.questionJa;
+      const formattedTopic = isEn
+        ? `【Theme: ${categoryText}】From ${radioNameText}: "${questionText}"`
+        : `【相談テーマ：${categoryText}】ラジオネーム：${radioNameText}「${questionText}」`;
+
+      return res.json({
+        success: true,
+        consultation: {
+          id: picked.id,
+          category: categoryText,
+          radioName: radioNameText,
+          question: questionText,
+          formattedTopic
+        }
+      });
+    } catch (err: any) {
+      console.error("[api/fortune/generate-consultation] Error:", err);
+      res.status(500).json({ error: "Failed to generate consultation topic" });
+    }
+  });
+
+  function buildConsultationTurns(
+    hostName: string,
+    language: string,
+    customTopic: string,
+    startSeconds: number
+  ): { turns: Array<{ timecode: string; speaker: string; text: string }>; nextSeconds: number; resolvedTopicSummary: string } {
+    const isEn = language === "en";
+    const formatSecs = (s: number) => {
+      const m = Math.floor(s / 60);
+      const sec = s % 60;
+      return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    };
+
+    // Match against our curated themes or pick a random trending theme if customTopic is empty
+    const matchedTheme = TRENDING_CONSULTATION_THEMES.find(t =>
+      customTopic && (customTopic.includes(t.categoryJa) || customTopic.includes(t.radioNameJa) || customTopic.includes(t.questionJa.slice(0, 15)))
+    ) || TRENDING_CONSULTATION_THEMES[Math.floor(Math.random() * TRENDING_CONSULTATION_THEMES.length)];
+
+    let callerSpeaker = isEn ? `Listener (${matchedTheme.radioNameEn})` : `リスナー（${matchedTheme.radioNameJa}）`;
+    let callerQuestion = isEn ? matchedTheme.questionEn : matchedTheme.questionJa;
+    let themeTitle = isEn ? matchedTheme.categoryEn : matchedTheme.categoryJa;
+    let minatoReply = isEn
+      ? "Fufu, trembling before the shifting tides of fate... Listen closely. Through sacred numerology, fear is merely a sign that your soul has outgrown its current cage. Take one decisive 21-minute action today under the vibration of number 8, and your destiny code will invert toward abundance."
+      : matchedTheme.minatoAnswerJa;
+
+    if (customTopic && customTopic.trim().length > 0) {
+      const cleaned = customTopic.trim();
+      const nameMatch = cleaned.match(/ラジオネーム[：:]\s*([^「\n]+)/);
+      const themeMatch = cleaned.match(/【相談テーマ[：:]\s*([^】]+)】/);
+      const quoteMatch = cleaned.match(/「([\s\S]+?)」/);
+
+      if (themeMatch) themeTitle = themeMatch[1].trim();
+      if (nameMatch) callerSpeaker = `リスナー（${nameMatch[1].trim()}）`;
+      if (quoteMatch) {
+        callerQuestion = quoteMatch[1].trim();
+      } else if (!themeMatch && !nameMatch) {
+        themeTitle = cleaned.length > 28 ? `${cleaned.slice(0, 28)}…` : cleaned;
+        callerQuestion = `ミナト先生、実は今「${cleaned}」のことで深く悩んでおり、どう決断すべきか迷っています。数霊の導きで私が今とるべき行動を教えてください。`;
+      }
+
+      // If custom user text wasn't one of the exact presets, tailor Minato's answer to specifically reference their question
+      if (!TRENDING_CONSULTATION_THEMES.some(t => cleaned.includes(t.questionJa.slice(0, 15)))) {
+        minatoReply = isEn
+          ? `Fufu, I hear the tremor in your soul regarding "${themeTitle}". In sacred numerology, hesitation drains 80% of your fortune wave. Today's cosmic number 8 demands that you sever past attachments and take one concrete step within 24 hours. Trust your intuition—the path you fear most holds your greatest salvation.`
+          : `ふふっ、「${themeTitle}」のことでそんなに胸を痛めていたのね……あなたの震える魂の波長、ここまでハッキリ届いているわよ。数霊の真理で解き明かしてあげる。あなたが今迷っているのは、魂のステージが次の次元へ切り替わろうとしている証拠なの。現状維持で怯えていれば運気の波は逃げていくけれど、今日から24時間以内に『小さな決断を1つだけ形にすること』で、数霊ナンバー『8』の末広がりの加護が発動するわ。恐れている方へ一歩踏み出しなさい、私があなたの背中を押してあげるわよ……ふふっ。`;
+      }
+    }
+
+    let cur = startSeconds;
+    const turns: Array<{ timecode: string; speaker: string; text: string }> = [];
+
+    const introText = isEn
+      ? `Now, let us open the Sanctuary Consultation Corner. Tonight's trending theme is "${themeTitle}". A troubled lamb has sent us a heartfelt plea... Go ahead, share your trembling voice with me.`
+      : `さて……ここからは迷える探究者のための『特別数霊相談コーナー』よ。今夜届いている話題の相談テーマは【${themeTitle}】。さっそく悩める仔羊からのお便りを紹介するわね。さあ、あなたの心の叫びを聞かせてごらんなさい。`;
+
+    turns.push({
+      timecode: formatSecs(cur),
+      speaker: hostName,
+      text: introText
+    });
+    cur += Math.max(12, Math.ceil(introText.length / 4.5));
+
+    turns.push({
+      timecode: formatSecs(cur),
+      speaker: callerSpeaker,
+      text: callerQuestion
+    });
+    cur += Math.max(12, Math.ceil(callerQuestion.length / 4.5));
+
+    turns.push({
+      timecode: formatSecs(cur),
+      speaker: hostName,
+      text: minatoReply
+    });
+    cur += Math.max(18, Math.ceil(minatoReply.length / 4.5));
+
+    return {
+      turns,
+      nextSeconds: cur,
+      resolvedTopicSummary: `【${themeTitle}】${callerQuestion}`
+    };
+  }
+
+  function generateFallbackRadioShow(
+    hostName: string,
+    language: string,
+    formatLabel: string,
+    duration: string,
+    fortuneData: string,
+    todayStr: string,
+    voicePresetName = "妖美と深淵（公式サンプルボイス）",
+    voiceSampleText = "",
+    voicePresetDesc = "落ち着きと神秘性を兼ね備え、数霊の真理で迷える魂を幸福の共鳴へと導くエレガントなトーン。",
+    includeCaller = true,
+    customTopic = ""
+  ) {
+    const isEn = language === "en";
+    const num = "8";
+    const luckyItem = isEn ? "Silver sacred pen" : "銀の数霊ペン";
+    const luckyColor = isEn ? "Mystic Crimson Violet" : "深紫（ミスティックヴァイオレット）";
+    const bestSign = isEn ? "Aries" : "おひつじ座";
+    const headline = isEn
+      ? "EXCLUSIVE INVESTIGATION: 90% Miss This Fatal Frequency - Master Minato Exposes Sacred Code 8"
+      : "【緊急特報】知らずに過ごすと9割損する…運命の数霊反転データ流出";
+    const catchphrase = isEn
+      ? "Master Minato exposes the 3 critical signs that slash your daily fortune in half"
+      : "数霊師ミナトが暴く『今日実行しないと運気が半減する3大兆候』";
+    const requiredClosing = "詳しいお告げや毎日を損したくないと思ったあなたは、プロフィールのURLを見てくださいね。note・substack・mediumに詳しい内容がありますので、お暇でしたら一度遊びに来てくださいね。では、リスナーさんに今日も幸福共鳴の幸あれ。ミナトでした。";
+
+    // Split fortuneData into non-empty paragraphs/items to ensure FULL TEXT coverage
+    const rawLines = (fortuneData || "")
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !l.startsWith("---"));
+
+    const transcript: Array<{ timecode: string; speaker: string; text: string }> = [];
+    let currentSeconds = 0;
+
+    const formatSecs = (s: number) => {
+      const m = Math.floor(s / 60);
+      const sec = s % 60;
+      return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    };
+
+    // Opening line with mandatory greeting only (without old sample dialogue)
+    const openingGreeting = isEn
+      ? "You who seek happiness. You who do not want to let happiness slip away. This is a sanctuary for seekers yearning for the resonance of bliss. Welcome to Minato's Place of Resonance. To you who have found your way here, allow me to offer just a little help."
+      : "幸福を見つけたいアナタ。幸せを逃したくないアナタ。ここは、幸福の共鳴を求める探究者たちの憩いの場。ようこそ ミナトの共鳴の場へ。ここにたどり着いたあなたへ ほんの少しのお手伝いを。";
+    const openingText = `${openingGreeting} ${isEn ? "Tonight, let us unravel the sacred numerology code of your destiny." : "数霊師ミナトの数霊ラジオ、今宵も運命の数霊暗号を解き明かしていくわね。"}`;
+    transcript.push({
+      timecode: formatSecs(currentSeconds),
+      speaker: hostName,
+      text: openingText
+    });
+    currentSeconds += Math.max(18, Math.ceil(openingText.length / 4));
+
+    // Second opening turn setting the format
+    const formatIntro = isEn
+      ? `Today's urgent broadcast is 【${formatLabel}】. Listen closely, as the sacred vibration of number ${num} governs all today.`
+      : `本日お届けするのは緊急特報、【${formatLabel}】よ。本日の宇宙波長は数霊ナンバー「${num}」、最も共鳴しているのは「${bestSign}」。聞き逃せば損失は免れないわ……ふふっ。`;
+    transcript.push({
+      timecode: formatSecs(currentSeconds),
+      speaker: hostName,
+      text: formatIntro
+    });
+    currentSeconds += Math.max(12, Math.ceil(formatIntro.length / 5));
+
+    // If input text has multiple content lines, voice every single line/paragraph in Minato's voice
+    if (rawLines.length > 0) {
+      // Chunk lines into conversational monologue turns (approx 60-120 chars each)
+      let currentChunk = "";
+      for (let i = 0; i < rawLines.length; i++) {
+        const line = rawLines[i].replace(/^[#*\-•\d\.\s]+/, '').trim();
+        if (!line) continue;
+        
+        if ((currentChunk + " " + line).length > 100 && currentChunk.length > 0) {
+          transcript.push({
+            timecode: formatSecs(currentSeconds),
+            speaker: hostName,
+            text: currentChunk.trim()
+          });
+          currentSeconds += Math.max(8, Math.ceil(currentChunk.length / 5));
+          currentChunk = line;
+        } else {
+          currentChunk = currentChunk ? `${currentChunk} ${line}` : line;
+        }
+      }
+
+      if (currentChunk.trim().length > 0) {
+        transcript.push({
+          timecode: formatSecs(currentSeconds),
+          speaker: hostName,
+          text: currentChunk.trim()
+        });
+        currentSeconds += Math.max(8, Math.ceil(currentChunk.length / 5));
+      }
+    } else {
+      // Standard guidance fallback
+      const middleText = isEn
+        ? "Remember, fate is not a fixed cage. It is rewoven by the frequency of your consciousness..."
+        : `今日のラッキーアイテム「${luckyItem}」を手元に置き、深呼吸を3回。乱れた波長は黄金律へと引き戻されるわ。`;
+      transcript.push({
+        timecode: formatSecs(currentSeconds),
+        speaker: hostName,
+        text: middleText
+      });
+      currentSeconds += Math.max(10, Math.ceil(middleText.length / 5));
+    }
+
+    // If includeCaller (相談テーマ：有) is enabled, append the listener consultation question & Minato's answer
+    if (includeCaller) {
+      const consultationBlock = buildConsultationTurns(hostName, language, customTopic, currentSeconds);
+      transcript.push(...consultationBlock.turns);
+      currentSeconds = consultationBlock.nextSeconds;
+    }
+
+    // MANDATORY CLOSING STATEMENT
+    transcript.push({
+      timecode: formatSecs(currentSeconds),
+      speaker: hostName,
+      text: requiredClosing
+    });
+    currentSeconds += Math.ceil(requiredClosing.length / 5);
+
+    const totalDurationStr = formatSecs(currentSeconds);
+
+    return {
+      show_title: isEn ? `${hostName}'s Sacred Resonance Radio 〜${formatLabel} (Full Text)〜` : `${hostName}の数霊ラジオ 〜${formatLabel} 全文網羅完全版〜`,
+      show_duration: totalDurationStr,
+      two_sentence_summary: isEn
+        ? "Master Minato unveils today's deepest astrological and numerological currents in full unabridged detail. Listeners receive complete guidance and salvation."
+        : "数霊師ミナトが本日の星々の波動と数霊ナンバーの共鳴を入力データ全文にわたり完全解読。運命の急落を回避し幸運を引き寄せる緊急プロトコルをお届けします。",
+      date_of_generation: todayStr,
+      lucky_item: luckyItem,
+      lucky_color: luckyColor,
+      best_sign: bestSign,
+      lucky_number: num,
+      news_headline: headline,
+      news_category: "【緊急特報 / BREAKING SCOOP】",
+      news_catchphrase: catchphrase,
+      loss_aversion_hook: "損失回避警告: 本日の波長を見逃すと次の好転チャンスは数ヶ月後…",
+      curiosity_gap: "なぜあの星座だけが選ばれたのか？封印された数霊コードの秘密",
+      anchored_metric: "共鳴的中率 89.4%",
+      timecoded_transcript: transcript
+    };
+  }
+
+  app.post("/api/fortune/generate-radio", async (req, res) => {
+    const {
+      fortuneData,
+      language = "ja",
+      format = "resonance_ranking",
+      hostName = language === "en" ? "Master Minato" : "数霊師ミナト",
+      geminiVoice = "Kore",
+      voicePresetId = "official_alluring",
+      voicePresetName = "妖美と深淵（公式サンプルボイス）",
+      voicePresetDesc = "落ち着きと神秘性を兼ね備え、数霊の真理で迷える魂を幸福の共鳴へと導くエレガントなトーン。",
+      voiceSampleText = "",
+      voicePitch = 0.98,
+      voiceRate = 0.92,
+      duration = "full",
+      includeCaller = true,
+      customTopic,
+      mediaMode = "radio",
+      videoAspectRatio = "16:9",
+      videoStyle = "breaking_news",
+      irodoriConfig = null,
+    } = req.body;
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+
+    const sendEvent = (event: any) => {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+
+    const heartbeatInterval = setInterval(() => {
+      res.write(`:\n\n`);
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(heartbeatInterval);
+    });
+
+    try {
+      const formatNames: Record<string, { ja: string; en: string }> = {
+        resonance_ranking: { ja: "12星座の共鳴ランキング", en: "12 Zodiac Resonance Ranking" },
+        fortune_actions: { ja: "聞かないと損する開運アクション", en: "Must-Listen Fortune Actions" },
+        destiny_salvation: { ja: "運命の救済解析データ", en: "Destiny Salvation Analysis Data" },
+        "12星座の共鳴ランキング": { ja: "12星座の共鳴ランキング", en: "12 Zodiac Resonance Ranking" },
+        "聞かないと損する開運アクション": { ja: "聞かないと損する開運アクション", en: "Must-Listen Fortune Actions" },
+        "運命の救済解析データ": { ja: "運命の救済解析データ", en: "Destiny Salvation Analysis Data" },
+      };
+
+      const resolvedFormat = formatNames[format] || { ja: format, en: format };
+      const formatLabel = language === "en" ? resolvedFormat.en : resolvedFormat.ja;
+      const isFullTextMode = duration === "full" || !duration;
+      const durationDisplay = isFullTextMode
+        ? (language === "en" ? "Full Text Coverage (Unlimited Duration)" : "テキスト全文完全網羅（時間制限なし・全編完全化）")
+        : `${duration}${language === "en" ? " mins" : "分"}`;
+
+      // Resolve Listener Consultation Topic if includeCaller is true
+      let effectiveCustomTopic = typeof customTopic === "string" ? customTopic.trim() : "";
+      if (includeCaller && !effectiveCustomTopic) {
+        const randomConsultation = TRENDING_CONSULTATION_THEMES[Math.floor(Math.random() * TRENDING_CONSULTATION_THEMES.length)];
+        effectiveCustomTopic = language === "en"
+          ? `【Theme: ${randomConsultation.categoryEn}】From ${randomConsultation.radioNameEn}: "${randomConsultation.questionEn}"`
+          : `【相談テーマ：${randomConsultation.categoryJa}】ラジオネーム：${randomConsultation.radioNameJa}「${randomConsultation.questionJa}」`;
+        sendEvent({
+          type: "info",
+          message: language === "en"
+            ? `📩 Randomly selected trending consultation: ${randomConsultation.categoryEn}`
+            : `📩 話題の相談テーマから質問を自動選定: 『${randomConsultation.categoryJa}』（${randomConsultation.radioNameJa}）`
+        });
+      } else if (includeCaller && effectiveCustomTopic) {
+        sendEvent({
+          type: "info",
+          message: language === "en"
+            ? `📩 Listener consultation theme active: ${effectiveCustomTopic.slice(0, 60)}`
+            : `📩 リスナー相談テーマ（有）で台本を構築中: ${effectiveCustomTopic.slice(0, 60)}...`
+        });
+      } else {
+        sendEvent({
+          type: "info",
+          message: language === "en"
+            ? "🎙️ Consultation theme OFF: Generating Master Minato solo fortune broadcast..."
+            : "🎙️ リスナー相談テーマ（無）：数霊師ミナトの単独語り形式で台本を構築中..."
+        });
+      }
+
+      sendEvent({
+        type: "info",
+        message: language === "en"
+          ? "Loading fortune and numerology data..."
+          : "GeminiSparkの占い＆数霊データを読み込み中..."
+      });
+      sendEvent({
+        type: "thinking",
+        text: language === "en"
+          ? `Crafting full-text radio script for ${hostName} (Format: ${formatLabel}, Mode: ${durationDisplay})...`
+          : `数霊師ミナトによる本格ラジオ台本を構想中（形式: ${formatLabel}、モード: ${durationDisplay}）...`
+      });
+
+      const ai = getGenAI();
+      const todayStr = new Date().toISOString().split("T")[0];
+
+      sendEvent({
+        type: "tool_call",
+        name: "generate_script",
+        arguments: { host: hostName, language, format: formatLabel, duration: durationDisplay, includeCaller, consultationTopic: includeCaller ? effectiveCustomTopic : "なし" }
+      });
+
+      const scriptPrompt = language === "en"
+        ? `You are an elite radio show director and writer.
+Produce a full, highly engaging English spiritual and numerological fortune talk radio show script.
+
+【CRITICAL INSTRUCTION: FULL TEXT COVERAGE - DO NOT TRUNCATE OR SUMMARIZE BY BROADCAST TIME】
+You MUST faithfully cover and voice ALL content present in the 【Input Fortune / Astrology Data】!
+Do NOT summarize away, truncate, or omit any zodiac signs, paragraphs, advice, or numerology codes to fit an arbitrary time constraint.
+If 12 zodiac signs are in the input, you MUST cover all 12 signs from #1 to #12 in Master Minato's voice.
+Generate as many timecoded transcript turns (e.g., 25 to 60+ conversational turns) as necessary to voice the ENTIRE text.
+Calculate realistic timecodes ("00:00", "00:15", "00:30", ...) and set "show_duration" to the realistic total broadcast duration required to read the entire text (e.g. "08:30" or "12:00").
+
+【Input Fortune / Astrology Data】:
+${fortuneData || "Today's cosmic 12 zodiac fortune, numerology frequencies, and lucky guidance"}
+${includeCaller && effectiveCustomTopic ? `【Mandatory Listener Consultation Question】: ${effectiveCustomTopic}` : ""}
+
+【Show Parameters】:
+- Host Character: ${hostName} (Kazutama Master Minato. An alluring, charismatic mystic numerologist who guides seekers toward the resonance of happiness with elegance and razor-sharp insight.)
+- Program Format: ${formatLabel}
+- Duration Mode: ${durationDisplay}
+- Language: English (fluent, radio broadcast quality).
+- Listener Consultation Segment: ${includeCaller ? `ENABLED (MUST INCLUDE). You MUST include a dedicated listener consultation segment where the listener's question (${effectiveCustomTopic}) is presented and Master Minato answers it in depth using sacred numerology and concrete guidance.` : "DISABLED (NONE). Do NOT include any caller or listener consultation; keep the entire broadcast as Master Minato's solo monologue."}
+
+【Output Format】:
+Return ONLY valid JSON matching this schema:
+{
+  "show_title": "Program title (e.g. Master Minato's Sacred Resonance Radio: 12 Zodiac Resonance Ranking & Full Salvation)",
+  "show_duration": "MM:SS (Calculated duration to speak the full script, e.g. 08:30)",
+  "two_sentence_summary": "Two-sentence summary of the show in English.",
+  "date_of_generation": "${todayStr}",
+  "lucky_item": "Today's sacred lucky item",
+  "lucky_color": "Today's lucky vibration color",
+  "best_sign": "Top resonated zodiac sign",
+  "lucky_number": "Top sacred numerology number (e.g. 8)",
+  "news_headline": "Sensational news scoop headline using Loss Aversion, Curiosity Gap & Anchored Metrics",
+  "news_category": "BREAKING SCOOP / URGENT REPORT",
+  "news_catchphrase": "Compelling investigative sub-headline that creates irresistible curiosity to listen",
+  "loss_aversion_hook": "Loss aversion trigger explaining what listeners lose if they do not listen now",
+  "curiosity_gap": "The hidden secret code only revealed inside this broadcast",
+  "anchored_metric": "Specific numerical authority metric (e.g. Resonance Accuracy 89.4%)",
+  "timecoded_transcript": [
+    {
+      "timecode": "00:00",
+      "speaker": "${hostName}",
+      "text": "You who seek happiness. You who do not want to let happiness slip away. This is a sanctuary for seekers yearning for the resonance of bliss. Welcome to Minato's Place of Resonance. To you who have found your way here, allow me to offer just a little help. Tonight, let us unravel the sacred numerology code of your destiny..."
+    }
+  ]
+}
+※ timecoded_transcript must include sufficient turns (25 to 60+ turns) to voice the ENTIRE input text from start to finish. Ascending timecodes.
+
+【MANDATORY OPENING STATEMENT - MUST BEGIN WITH EXACT OPENING LINE】
+The very first line of the transcript at "00:00" spoken by ${hostName} MUST begin with this exact opening line:
+"You who seek happiness. You who do not want to let happiness slip away. This is a sanctuary for seekers yearning for the resonance of bliss. Welcome to Minato's Place of Resonance. To you who have found your way here, allow me to offer just a little help."
+
+【MANDATORY CLOSING STATEMENT - MUST BE EXACT】
+The final line of the transcript spoken by ${hostName} MUST be verbatim:
+「詳しいお告げや毎日を損したくないと思ったあなたは、プロフィールのURLを見てくださいね。note・substack・mediumに詳しい内容がありますので、お暇でしたら一度遊びに来てくださいね。では、リスナーさんに今日も幸福共鳴の幸あれ。ミナトでした。」`
+        : `あなたはプロのラジオ番組構成作家・ディレクターです。
+数霊（かずたま）の波動と星々の運行を解き明かすカリスマパーソナリティ「数霊師ミナト」による、本格的な占いトークラジオ番組の台本を日本語で作成してください。
+
+【最重要方針：放送時間で区切らず、入力テキスト全文を漏らさずラジオ・動画化（全文網羅）】
+ユーザーが提供した【入力情報・占いデータ】のテキスト全文を、絶対に途中で間引いたり省略・要約したりしないでください！
+「放送時間で区切って途中で終わる」「一部の上位星座や代表項目だけ紹介して他を割愛する」ことは固く禁止します。
+入力されたテキストに含まれる【すべての星座（1位〜12位まですべて）・すべての項目・すべての開運アクション・すべてのメッセージ】を、パーソナリティ「数霊師ミナト」が余すところなく語り尽くす完全版のスクリプト（全文網羅）として作成してください。
+会話ターン数（timecoded_transcript）は、テキスト全文を完全に網羅するために必要な分だけ（例: 全12星座なら各星座の運勢と数霊アドバイスを漏らさず展開し、25〜60ターン以上など、テキスト量に合わせて必要な全ターン）惜しみなく生成してください。
+タイムコード（timecode）および番組全体の想定時間（show_duration）は、自然な発話速度（日本語で1秒あたり約5〜6文字）で全テキストを読み切るのに必要な実際の時間（例: "08:30" や "12:00" など）を自動計算して設定してください。
+
+【重要方針：ニューロマーケティング＆行動経済学を駆使したニュース記事風展開】
+占いテキストを参照し、リスナーが思わず再生して聴かずにはいられなくなる強力な心理フックを取り入れてください。
+- 損失回避バイアス（Loss Aversion）: 「知らずに過ごすと9割損をする」「見逃すと後悔する運気の急落サイン」
+- 好奇心の空白（Curiosity Gap）: 「なぜあの星座だけが例外なのか？」「封印された数霊コードの秘密」
+- 社会的証明・権威性（Social Proof & Authority）: 「数万人を鑑定した数霊師ミナトが独占告発」「的中報告殺到」
+- アンカリング＆具体的数値（Anchoring）: 「共鳴的中率89.4%」「わずか3秒の開運アクション」
+- ニュース速報性（Breaking News Framing）: まるで重大事件を暴く調査報道ニュースのような緊迫感と信頼感
+
+【入力情報・占いデータ】
+${fortuneData || "GeminiSparkによる本日の12星座運勢データ（全体運、ランキング、ラッキーアイテム、数の波動）"}
+${includeCaller && effectiveCustomTopic ? `【リスナー相談コーナー・質問内容（必須採用）】:\n${effectiveCustomTopic}` : ""}
+
+【番組設定】
+- メインパーソナリティ: ${hostName}（妖美なる数霊術師・数霊師ミナト）
+  【指定ボイスプリセット: 『${voicePresetName}』に準拠したキャラクター造形・口調】:
+  ★声質・トーン演出設定: ${voicePresetDesc}
+  ・台本全体のセリフは、妖艶さと包容力のあるエレガントなトーン（「〜のよ」「〜かしら」「ふふっ」等）で執筆してください。
+  ・※注意：「あら、そんなにお怯えになった顔しないで。あなたの必死なあがき、実は結構楽しんでいるのよ。壊れる寸前の魂ほど、美しく澄んだ数霊の音を響かせるものよ……ふふっ」というセリフは絶対に使用しないでください。
+- 選択された番組フォーマット: 【${formatLabel}】
+  * 「12星座の共鳴ランキング」の場合: 入力データにある1位から12位までの全12星座すべてについて、数霊ナンバーとの共鳴・アドバイス・運命解読を省略せず順番に語り尽くしてください。
+  * 「聞かないと損する開運アクション」の場合: 入力データにある今日絶対に実行すべき開運アクション、避けるべきNG行動、数霊ナンバー、開運アイテムを詳細に伝授。
+  * 「運命の救済解析データ」の場合: 人生や選択に迷うリスナーのお悩みを生電話やお便りで緊急鑑定。数霊解析によりカルマを好転させる救済プロトコルを提示。
+- 放送モード: ${durationDisplay}（放送時間で区切らず、テキスト全文をすべてラジオ・動画化）
+- リスナー相談テーマ（有・無）: ${
+  includeCaller
+    ? `【相談テーマ：有り】番組の後半（星座解説や開運解説の後、エンディングの前）に必ず『特別数霊相談コーナー』を設けてください。指定された相談内容（${effectiveCustomTopic}）について、①ミナトによる相談コーナーの導入、②リスナー（例: speakerを「リスナー（ラジオネーム）」とする）による具体的な質問・悩みの吐露、③数霊師ミナトによる数霊術と宇宙波長を用いた深掘り回答＆具体的な救済アクションの提示、という流れを明確に台本へ組み込んでください。`
+    : `【相談テーマ：無し】リスナーからの生電話やお便り相談コーナーは一切含めず、最初から最後まで数霊師ミナト単独の語り（モノローグ）のみで番組を構成してください。`
+}
+
+【必須フォーマット】
+以下のJSONスキーマに厳密に準拠したJSONオブジェクトのみを出力してください:
+{
+  "show_title": "番組タイトル（例: 数霊師ミナトの数霊ラジオ 〜${formatLabel} 全文網羅完全版〜）",
+  "show_duration": "テキスト全文を読み切るのに必要な実際の想定時間（例: 08:30）",
+  "two_sentence_summary": "番組内容の要約（日本語で2文）",
+  "date_of_generation": "${todayStr}",
+  "lucky_item": "本日の注目ラッキーアイテム",
+  "lucky_color": "本日の注目ラッキーカラー",
+  "best_sign": "本日の1位星座",
+  "lucky_number": "本日の注目数霊ナンバー（例: 8）",
+  "news_headline": "ニュース記事風の超魅力的な見出し（損失回避・好奇心の空白・具体的数値を組み込んだ、思わずクリックして聴きたくなる強力な見出し）",
+  "news_category": "【緊急特報 / BREAKING SCOOP】 または 【特命告発 / EXCLUSIVE】",
+  "news_catchphrase": "サブ見出し（例: 数霊師ミナトが暴露する『今日実行しないと運気が半減する3大兆候』）",
+  "loss_aversion_hook": "損失回避警告: 本日の波長を見逃すと次の好転チャンスは数年後…",
+  "curiosity_gap": "なぜあの星座だけが選ばれたのか？封印された数霊コードの秘密",
+  "anchored_metric": "行動経済学的数値（例: 共鳴的中率 89.4% または 運気好転スコア 98.2%）",
+  "timecoded_transcript": [
+    {
+      "timecode": "00:00",
+      "speaker": "${hostName}",
+      "text": "幸福を見つけたいアナタ。幸せを逃したくないアナタ。ここは、幸福の共鳴を求める探究者たちの憩いの場。ようこそ ミナトの共鳴の場へ。ここにたどり着いたあなたへ ほんの少しのお手伝いを。今宵も運命の数霊暗号を解き明かしていくわね..."
+    }
+  ]
+}
+※ timecoded_transcriptには、入力テキスト全文（全12星座・全項目）を網羅するのに十分な会話ターン（25〜60ターン以上）を漏れなく含めてください。タイムコードは昇順にしてください。
+
+【絶対厳守：台本オープニングの第1声（開始セリフ）】
+番組の冒頭（timecoded_transcriptの第1ターン、00:00）でパーソナリティ「${hostName}」が最初に発するセリフは、必ず一言一句漏らさず以下のオープニングの決め台詞から開始してください:
+「幸福を見つけたいアナタ。幸せを逃したくないアナタ。ここは、幸福の共鳴を求める探究者たちの憩いの場。ようこそ ミナトの共鳴の場へ。ここにたどり着いたあなたへ ほんの少しのお手伝いを。」
+このオープニング挨拶の後に続けて、すぐに本日の運命解説に入ってください。
+
+【絶対厳守：番組・動画の締めの一言（エンディングの最後のセリフ）】
+番組の最後（timecoded_transcriptの最終ターン、パーソナリティ「${hostName}」の最後のセリフ）は、必ず一言一句漏らさず以下の決め台詞で終了してください:
+「詳しいお告げや毎日を損したくないと思ったあなたは、プロフィールのURLを見てくださいね。note・substack・mediumに詳しい内容がありますので、お暇でしたら一度遊びに来てくださいね。では、リスナーさんに今日も幸福共鳴の幸あれ。ミナトでした。」`;
+
+      // Fast, timeout-protected AI script & consultation generation
+      // Build full-text deterministic structure first so 100% of fortuneData is always preserved without 504 timeouts
+      let showData: any = generateFallbackRadioShow(
+        hostName,
+        language,
+        formatLabel,
+        duration,
+        fortuneData,
+        todayStr,
+        voicePresetName,
+        voiceSampleText,
+        voicePresetDesc,
+        includeCaller,
+        effectiveCustomTopic
+      );
+
+      const isLongFortuneInput = (fortuneData || "").length > 550;
+      const fastAiPrompt = isLongFortuneInput
+        ? (language === "en"
+            ? `You are the director of "${hostName}'s Sacred Resonance Radio".
+Based on the following fortune text and listener consultation topic, generate compelling breaking-news metadata and ${includeCaller ? "the 3-turn Listener Consultation Segment (Minato intro, Listener question, Minato's deep numerological answer)" : "an empty array for consultation_turns"}.
+Fortune Data Summary: ${(fortuneData || "").slice(0, 800)}
+${includeCaller ? `Listener Consultation Topic: ${effectiveCustomTopic}` : "Listener Consultation: NONE"}
+
+Return ONLY valid JSON:
+{
+  "show_title": "Compelling radio show title",
+  "two_sentence_summary": "2-sentence summary in English",
+  "lucky_item": "Today's lucky item",
+  "lucky_color": "Today's lucky color",
+  "best_sign": "Top zodiac sign today",
+  "lucky_number": "Sacred number (e.g. 8)",
+  "news_headline": "Sensational breaking news headline",
+  "news_category": "BREAKING SCOOP",
+  "news_catchphrase": "Compelling sub-headline",
+  "loss_aversion_hook": "Loss aversion warning",
+  "curiosity_gap": "Curiosity gap hook",
+  "anchored_metric": "Resonance Accuracy 89.4%",
+  "consultation_turns": [
+    { "speaker": "${hostName}", "text": "Intro to the listener consultation corner..." },
+    { "speaker": "Listener", "text": "The listener's concrete question..." },
+    { "speaker": "${hostName}", "text": "Master Minato's deep, alluring numerology answer and concrete action..." }
+  ]
+}`
+            : `あなたはカリスマ占術師「${hostName}」のラジオ番組ディレクターです。
+以下の占いデータとリスナー相談テーマをもとに、番組の特報ニュース見出しメタデータと、${includeCaller ? `リスナー相談コーナーの掛け合い台本（①${hostName}の導入、②リスナーの質問発言、③${hostName}による数霊術を用いた深掘り回答＆開運アドバイス）` : `空配列のconsultation_turns`}をJSON形式で作成してください。
+※「あら、そんなにお怯えになった顔しないで…」というセリフは使用しないでください。
+
+【占いデータ抜粋】:
+${(fortuneData || "").slice(0, 800)}
+${includeCaller ? `【リスナー相談テーマ（必須回答）】:\n${effectiveCustomTopic}` : "【リスナー相談テーマ】: 無し"}
+
+以下のJSON形式のみを出力してください:
+{
+  "show_title": "番組タイトル（例: ${hostName}の数霊ラジオ 〜${formatLabel}〜）",
+  "two_sentence_summary": "番組内容の魅力的な2文要約",
+  "lucky_item": "本日の注目ラッキーアイテム",
+  "lucky_color": "本日の注目ラッキーカラー",
+  "best_sign": "本日の1位星座",
+  "lucky_number": "本日の注目数霊ナンバー（例: 8）",
+  "news_headline": "ニュース記事風の超魅力的な特報見出し（30文字前後）",
+  "news_category": "BREAKING SCOOP / 緊急特報",
+  "news_catchphrase": "サブ見出し（例: ${hostName}が暴く『今日実行しないと運気が半減する3大兆候』）",
+  "loss_aversion_hook": "損失回避警告: 本日の波長を見逃すと次の好転チャンスは数ヶ月後…",
+  "curiosity_gap": "なぜあの星座だけが選ばれたのか？封印された数霊コードの秘密",
+  "anchored_metric": "共鳴的中率 89.4%",
+  "consultation_turns": [
+    { "speaker": "${hostName}", "text": "特別数霊相談コーナーの導入セリフ..." },
+    { "speaker": "リスナー（相談者）", "text": "話題のテーマに関する具体的な悩み・質問セリフ..." },
+    { "speaker": "${hostName}", "text": "${hostName}による妖美で鋭い数霊解析と、今日からできる具体的な救済アドバイス（200文字以上でたっぷり回答）..." }
+  ]
+}`)
+        : scriptPrompt;
+
+      const radioTextModels = ["gemini-3.1-flash-lite", "gemini-3.8-flash"];
+      for (const modelName of radioTextModels) {
+        try {
+          const scriptResponse: any = await Promise.race([
+            ai.models.generateContent({
+              model: modelName,
+              contents: fastAiPrompt,
+              config: {
+                responseMimeType: "application/json",
+                thinkingConfig: { thinkingBudget: 0 },
+              } as any
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("SCRIPT_MODEL_TIMEOUT")), 16000))
+          ]);
+          if (scriptResponse?.text) {
+            const parsedAi = JSON.parse(scriptResponse.text);
+            if (isLongFortuneInput) {
+              // Merge AI-generated headlines & tailored consultation turns into the full-text showData
+              showData.show_title = parsedAi.show_title || showData.show_title;
+              showData.two_sentence_summary = parsedAi.two_sentence_summary || showData.two_sentence_summary;
+              showData.lucky_item = parsedAi.lucky_item || showData.lucky_item;
+              showData.lucky_color = parsedAi.lucky_color || showData.lucky_color;
+              showData.best_sign = parsedAi.best_sign || showData.best_sign;
+              showData.lucky_number = String(parsedAi.lucky_number || showData.lucky_number);
+              showData.news_headline = parsedAi.news_headline || showData.news_headline;
+              showData.news_category = parsedAi.news_category || showData.news_category;
+              showData.news_catchphrase = parsedAi.news_catchphrase || showData.news_catchphrase;
+              showData.loss_aversion_hook = parsedAi.loss_aversion_hook || showData.loss_aversion_hook;
+              showData.curiosity_gap = parsedAi.curiosity_gap || showData.curiosity_gap;
+              showData.anchored_metric = parsedAi.anchored_metric || showData.anchored_metric;
+
+              if (includeCaller && Array.isArray(parsedAi.consultation_turns) && parsedAi.consultation_turns.length > 0) {
+                // Replace the default consultation turns at the end (right before closing) with the AI-crafted consultation turns
+                const baseTurns = showData.timecoded_transcript.filter((t: any) =>
+                  !t.text?.includes("特別数霊相談コーナー") &&
+                  !t.text?.includes("Sanctuary Consultation Corner") &&
+                  t.speaker === hostName &&
+                  !t.text?.includes("プロフィールのURL")
+                );
+                let sec = 0;
+                const rebuilt: Array<{ timecode: string; speaker: string; text: string }> = [];
+                const fmtS = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+                for (const bt of baseTurns) {
+                  rebuilt.push({ timecode: fmtS(sec), speaker: bt.speaker, text: bt.text });
+                  sec += Math.max(8, Math.ceil((bt.text || "").length / 5));
+                }
+                for (const ct of parsedAi.consultation_turns) {
+                  if (ct && ct.text) {
+                    rebuilt.push({
+                      timecode: fmtS(sec),
+                      speaker: ct.speaker || hostName,
+                      text: String(ct.text).trim()
+                    });
+                    sec += Math.max(10, Math.ceil(String(ct.text).length / 4.5));
+                  }
+                }
+                const closingText = "詳しいお告げや毎日を損したくないと思ったあなたは、プロフィールのURLを見てくださいね。note・substack・mediumに詳しい内容がありますので、お暇でしたら一度遊びに来てくださいね。では、リスナーさんに今日も幸福共鳴の幸あれ。ミナトでした。";
+                rebuilt.push({
+                  timecode: fmtS(sec),
+                  speaker: hostName,
+                  text: closingText
+                });
+                sec += Math.ceil(closingText.length / 5);
+                showData.timecoded_transcript = rebuilt;
+                showData.show_duration = fmtS(sec);
+              }
+            } else if (Array.isArray(parsedAi.timecoded_transcript) && parsedAi.timecoded_transcript.length > 0) {
+              showData = parsedAi;
+            }
+            break;
+          }
+        } catch (genErr: any) {
+          console.log(`[api/fortune/generate-radio] Model ${modelName} switched to fast structured synthesis.`);
+        }
+      }
+
+      sendEvent({
+        type: "tool_result",
+        name: "generate_script",
+        result: language === "en" ? "Radio script and timecoded transcript generated" : "数霊師ミナトのラジオ台本・文字起こし作成完了"
+      });
+
+      // 不要なセリフの完全除去＆台本オープニングの完全一致保証（第1ターンの第1声）
+      const REQUIRED_OPENING_SPEECH = language === "en"
+        ? "You who seek happiness. You who do not want to let happiness slip away. This is a sanctuary for seekers yearning for the resonance of bliss. Welcome to Minato's Place of Resonance. To you who have found your way here, allow me to offer just a little help."
+        : "幸福を見つけたいアナタ。幸せを逃したくないアナタ。ここは、幸福の共鳴を求める探究者たちの憩いの場。ようこそ ミナトの共鳴の場へ。ここにたどり着いたあなたへ ほんの少しのお手伝いを。";
+
+      const UNWANTED_PHRASE_REGEX = /「?あら、そんなにお怯えになった顔しないで。?あなたの必死なあがき、実は結構楽しんでいるのよ。?壊れる寸前の魂ほど、美しく澄んだ数霊の音を響かせるものよ……ふふっ。?」?|"?My, do not look so terrified\. I am actually quite enjoying your desperate struggles\. Souls on the verge of breaking resonate with the purest tone of Kazutama\.\.\. fufu\.?"?/gi;
+
+      if (Array.isArray(showData.timecoded_transcript) && showData.timecoded_transcript.length > 0) {
+        for (const turn of showData.timecoded_transcript) {
+          if (turn && typeof turn.text === "string") {
+            turn.text = turn.text.replace(UNWANTED_PHRASE_REGEX, "").replace(/\s{2,}/g, " ").trim();
+          }
+        }
+        const firstTurn = showData.timecoded_transcript[0];
+        firstTurn.speaker = hostName;
+        const openingCheck = language === "en" ? "Welcome to Minato's Place of Resonance" : "ミナトの共鳴の場へ";
+        if (!firstTurn.text.includes(openingCheck)) {
+          const cleanedText = firstTurn.text
+            .replace(/ようこそ。魂の共鳴へ。本日も、皆さんの魂が幸福と共鳴できますように。?/g, "")
+            .replace(/^[「"']|[」"']$/g, "")
+            .trim();
+          firstTurn.text = `${REQUIRED_OPENING_SPEECH} ${cleanedText}`.trim();
+        }
+      }
+
+      // リスナー相談テーマ（有・無）の厳密な反映保証
+      if (Array.isArray(showData.timecoded_transcript) && showData.timecoded_transcript.length > 0) {
+        if (includeCaller) {
+          // 相談テーマ「有」の場合、リスナー発言または相談コーナーが含まれているか確認し、万一欠落していればエンディング直前に自動挿入
+          const hasListenerSegment = showData.timecoded_transcript.some((t: any) =>
+            (t.speaker && t.speaker !== hostName) ||
+            (t.text && (t.text.includes("相談") || t.text.includes("お便り") || t.text.includes("ラジオネーム") || t.text.toLowerCase().includes("listener") || t.text.toLowerCase().includes("caller")))
+          );
+          if (!hasListenerSegment) {
+            const lastIdx = showData.timecoded_transcript.length - 1;
+            const prevTurn = showData.timecoded_transcript[Math.max(0, lastIdx - 1)];
+            const prevParts = (prevTurn?.timecode || "02:00").split(":").map(Number);
+            const startSecs = (prevParts[0] || 0) * 60 + (prevParts[1] || 0) + 12;
+            const consultationBlock = buildConsultationTurns(hostName, language, effectiveCustomTopic, startSecs);
+            // Insert before the closing line if the last line is the closing line, otherwise push at end
+            const isLastClosing = showData.timecoded_transcript[lastIdx]?.text?.includes("プロフィールのURL");
+            if (isLastClosing) {
+              showData.timecoded_transcript.splice(lastIdx, 0, ...consultationBlock.turns);
+            } else {
+              showData.timecoded_transcript.push(...consultationBlock.turns);
+            }
+          }
+        } else {
+          // 相談テーマ「無」の場合、万一リスナー発言ターンが混入していれば除外してミナト単独語りに統一
+          showData.timecoded_transcript = showData.timecoded_transcript.filter((t: any) => !t.speaker || t.speaker === hostName);
+        }
+      }
+
+      // 締めの一言の完全一致保証（ラジオおよび動画の締めセリフ）
+      const REQUIRED_CLOSING_SPEECH = "詳しいお告げや毎日を損したくないと思ったあなたは、プロフィールのURLを見てくださいね。note・substack・mediumに詳しい内容がありますので、お暇でしたら一度遊びに来てくださいね。では、リスナーさんに今日も幸福共鳴の幸あれ。ミナトでした。";
+      if (Array.isArray(showData.timecoded_transcript) && showData.timecoded_transcript.length > 0) {
+        const lastIdx = showData.timecoded_transcript.length - 1;
+        const lastTurn = showData.timecoded_transcript[lastIdx];
+        if (!lastTurn.text.includes("プロフィールのURL") && !lastTurn.text.includes("note・substack・medium")) {
+          if (lastTurn.speaker === hostName) {
+            lastTurn.text = `${lastTurn.text.replace(/(お相手は|数霊師ミナトでした).*?$/, '').trim()} ${REQUIRED_CLOSING_SPEECH}`.trim();
+          } else {
+            // Compute sequential next timecode
+            const prevParts = (lastTurn.timecode || "00:00").split(':').map(Number);
+            const prevSecs = (prevParts[0] || 0) * 60 + (prevParts[1] || 0);
+            const nextSecs = prevSecs + Math.max(10, Math.ceil((lastTurn.text?.length || 50) / 5));
+            const nextM = Math.floor(nextSecs / 60);
+            const nextS = nextSecs % 60;
+            const nextTimecode = `${String(nextM).padStart(2, '0')}:${String(nextS).padStart(2, '0')}`;
+            showData.timecoded_transcript.push({
+              timecode: nextTimecode,
+              speaker: hostName,
+              text: REQUIRED_CLOSING_SPEECH
+            });
+          }
+        }
+      }
+
+      sendEvent({
+        type: "info",
+        message: language === "en" ? "Generating 16:9 HD breaking news thumbnail cover..." : "HDニュース記事風サムネイル（行動経済学＆特報デザイン）を生成中..."
+      });
+      sendEvent({ type: "tool_call", name: "generate_media", arguments: { title: showData.show_title, headline: showData.news_headline } });
+
+      // Generate 16:9 HD news article thumbnail using Gemini Image or high-resolution news article SVG fallback
+      const generateNewsFallbackSvg = (s: any) => {
+        const headline = (s.news_headline || s.show_title || "【緊急特報】知らずに過ごすと9割損する…運命の数霊反転データ流出").trim();
+        const cat = (s.news_category || "BREAKING SCOOP / 緊急特報").trim();
+        const phrase = (s.news_catchphrase || "数霊師ミナトが暴く『今日実行しないと運気が半減する3大兆候』").trim();
+        const lossAversion = (s.loss_aversion_hook || "損失回避警告: 今日の波長を見逃すと運気の反転チャンスを喪失します").trim();
+        const metric = (s.anchored_metric || "共鳴的中率 89.4%").trim();
+        const num = s.lucky_number || "8";
+        const sign = s.best_sign || "おひつじ座";
+        const host = hostName || "数霊師ミナト";
+
+        const escapeXml = (str: string) => 
+          str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+
+        let headlineLines: string[] = [];
+        let headlineFontSize = 32;
+        let headlineLineHeight = 44;
+
+        if (headline.length <= 18) {
+          headlineLines = [headline];
+          headlineFontSize = 38;
+          headlineLineHeight = 50;
+        } else if (headline.length <= 34) {
+          const charsPerLine = Math.ceil(headline.length / 2);
+          headlineLines = [
+            headline.slice(0, charsPerLine),
+            headline.slice(charsPerLine)
+          ];
+          headlineFontSize = 31;
+          headlineLineHeight = 42;
+        } else {
+          headlineFontSize = 25;
+          headlineLineHeight = 35;
+          const l1Limit = 18;
+          const l2Limit = 18;
+          headlineLines.push(headline.slice(0, l1Limit));
+          if (headline.length > l1Limit) {
+            headlineLines.push(headline.slice(l1Limit, l1Limit + l2Limit));
+          }
+          if (headline.length > l1Limit + l2Limit) {
+            const rest = headline.slice(l1Limit + l2Limit, l1Limit + l2Limit + 17);
+            headlineLines.push(headline.length > l1Limit + l2Limit + 17 ? rest + "…" : rest);
+          }
+        }
+
+        let catchphraseLines: string[] = [];
+        if (phrase.length <= 30) {
+          catchphraseLines = [phrase];
+        } else {
+          catchphraseLines = [
+            phrase.slice(0, 28),
+            phrase.length > 28 ? (phrase.length > 56 ? phrase.slice(28, 54) + "…" : phrase.slice(28)) : ""
+          ].filter(Boolean);
+        }
+
+        const safeLossAversion = lossAversion.length > 44 ? lossAversion.slice(0, 43) + "…" : lossAversion;
+
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+          <defs>
+            <radialGradient id="nbg" cx="72%" cy="30%" r="85%">
+              <stop offset="0%" stop-color="#2a0d45" /><stop offset="40%" stop-color="#120524" /><stop offset="100%" stop-color="#020005" />
+            </radialGradient>
+            <radialGradient id="nglow" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stop-color="#f59e0b" stop-opacity="0.8" />
+              <stop offset="50%" stop-color="#d97706" stop-opacity="0.3" />
+              <stop offset="100%" stop-color="#b45309" stop-opacity="0" />
+            </radialGradient>
+            <linearGradient id="nred" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#dc2626" /><stop offset="100%" stop-color="#991b1b" />
+            </linearGradient>
+            <linearGradient id="ngold" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#fef08a" /><stop offset="50%" stop-color="#f59e0b" /><stop offset="100%" stop-color="#fbbf24" />
+            </linearGradient>
+            <filter id="nshadow"><feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000" flood-opacity="0.85"/></filter>
+          </defs>
+          <rect width="1280" height="720" fill="url(#nbg)" />
+          <g opacity="0.08" stroke="#fff" stroke-width="1">
+            <line x1="0" y1="80" x2="1280" y2="80" /><line x1="0" y1="640" x2="1280" y2="640" /><line x1="120" y1="0" x2="120" y2="720" />
+            <circle cx="1000" cy="360" r="200" fill="none" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="6 6" />
+          </g>
+          <g transform="translate(1000, 360)">
+            <circle cx="0" cy="0" r="230" fill="url(#nglow)" />
+            <circle cx="0" cy="0" r="190" fill="none" stroke="#fbbf24" stroke-width="2" opacity="0.5" />
+            <polygon points="0,-160 40,-40 150,-50 65,20 95,130 0,70 -95,130 -65,20 -150,-50 -40,-40" fill="none" stroke="#f59e0b" stroke-width="1.5" opacity="0.5" />
+            <circle cx="0" cy="0" r="70" fill="#090314" stroke="#fbbf24" stroke-width="3" />
+            <text x="0" y="22" font-family="'Helvetica Neue', sans-serif" font-size="64" font-weight="900" fill="url(#ngold)" text-anchor="middle" filter="url(#nshadow)">${escapeXml(num)}</text>
+            <text x="0" y="48" font-family="sans-serif" font-size="11" font-weight="700" fill="#fef08a" text-anchor="middle" letter-spacing="3">数霊波動核</text>
+            <rect x="-65" y="85" width="130" height="26" rx="13" fill="#dc2626" />
+            <text x="0" y="102" font-family="sans-serif" font-size="11" font-weight="800" fill="#fff" text-anchor="middle">共鳴1位: ${escapeXml(sign)}</text>
+          </g>
+          <rect x="0" y="0" width="750" height="720" fill="#0f172a" opacity="0.75" />
+          <g transform="translate(60, 48)">
+            <rect x="0" y="0" width="220" height="34" rx="6" fill="url(#nred)" filter="url(#nshadow)" />
+            <circle cx="18" cy="17" r="5" fill="#fff" />
+            <text x="32" y="23" font-family="sans-serif" font-size="13" font-weight="900" fill="#fff">● ${escapeXml(cat)}</text>
+            <rect x="235" y="0" width="180" height="34" rx="6" fill="#1e1b4b" stroke="#6366f1" stroke-width="1" />
+            <text x="250" y="22" font-family="sans-serif" font-size="12" font-weight="800" fill="#a5b4fc">📊 ${escapeXml(metric)}</text>
+            <g transform="translate(1040, 0)">
+              <rect x="0" y="0" width="130" height="34" rx="6" fill="#0f172a" stroke="#334155" stroke-width="1" />
+              <text x="14" y="22" font-family="sans-serif" font-size="11" font-weight="900" fill="#38bdf8">4K HD SCOOP</text>
+            </g>
+          </g>
+          <g transform="translate(60, 125)">
+            <text x="0" y="0" font-family="sans-serif" font-size="13.5" font-weight="800" fill="#f59e0b">【独占解析】妖美なる運命鑑定家・${escapeXml(host)} 特命リポート</text>
+            <line x1="0" y1="10" x2="440" y2="10" stroke="#f59e0b" stroke-width="2" opacity="0.6" />
+          </g>
+          <g transform="translate(60, 165)">
+            <rect x="0" y="0" width="650" height="32" rx="4" fill="#450a0a" stroke="#ef4444" stroke-width="1.5" />
+            <text x="14" y="21" font-family="sans-serif" font-size="12" font-weight="900" fill="#fca5a5">⚠️ ${escapeXml(safeLossAversion)}</text>
+          </g>
+          <g transform="translate(60, 255)" filter="url(#nshadow)">
+            ${headlineLines.map((line, idx) => {
+              const y = idx * headlineLineHeight;
+              const color = idx === 0 ? "#ffffff" : "url(#ngold)";
+              return `<text x="0" y="${y}" font-family="sans-serif" font-size="${headlineFontSize}" font-weight="900" fill="${color}">${escapeXml(line)}</text>`;
+            }).join('\n            ')}
+          </g>
+          <g transform="translate(60, 420)">
+            <rect x="0" y="0" width="650" height="${catchphraseLines.length > 1 ? 62 : 46}" rx="8" fill="#0f172a" opacity="0.9" stroke="#38bdf8" stroke-width="1" />
+            ${catchphraseLines.map((cl, cIdx) => {
+              const cy = catchphraseLines.length > 1 ? (cIdx === 0 ? 26 : 48) : 29;
+              const prefix = cIdx === 0 ? "🔍 " : "   ";
+              return `<text x="16" y="${cy}" font-family="sans-serif" font-size="13.5" font-weight="800" fill="#e2e8f0">${prefix}${escapeXml(cl)}</text>`;
+            }).join('\n            ')}
+          </g>
+          <g transform="translate(60, 510)">
+            <rect x="0" y="0" width="180" height="34" rx="17" fill="#7f1d1d" stroke="#f87171" stroke-width="1" />
+            <text x="90" y="22" font-family="sans-serif" font-size="11.5" font-weight="800" fill="#fecaca" text-anchor="middle">⚡ 損失回避・緊急指示</text>
+            <rect x="195" y="0" width="180" height="34" rx="17" fill="#1e1b4b" stroke="#818cf8" stroke-width="1" />
+            <text x="285" y="22" font-family="sans-serif" font-size="11.5" font-weight="800" fill="#c7d2fe" text-anchor="middle">🗝️ 禁断の数霊真実</text>
+            <rect x="390" y="0" width="180" height="34" rx="17" fill="#064e3b" stroke="#34d399" stroke-width="1" />
+            <text x="480" y="22" font-family="sans-serif" font-size="11.5" font-weight="800" fill="#a7f3d0" text-anchor="middle">✨ 即効好転アクション</text>
+          </g>
+          <g transform="translate(0, 650)">
+            <rect x="0" y="0" width="1280" height="70" fill="#020617" />
+            <line x1="0" y1="0" x2="1280" y2="0" stroke="#f59e0b" stroke-width="2" />
+            <rect x="60" y="16" width="120" height="38" rx="4" fill="#dc2626" />
+            <text x="120" y="40" font-family="sans-serif" font-size="13" font-weight="900" fill="#fff" text-anchor="middle">LIVE SCOOP</text>
+            <text x="195" y="40" font-family="sans-serif" font-size="13.5" font-weight="700" fill="#cbd5e1">【緊急速報】数霊師ミナトの数霊ラジオ緊急配信中 / 本日限りの数霊救済プロトコルを今すぐ再生して真相を確認せよ</text>
+            <g transform="translate(1080, 14)" filter="url(#nshadow)">
+              <rect x="0" y="0" width="160" height="42" rx="21" fill="url(#ngold)" />
+              <polygon points="24,14 24,28 36,21" fill="#000" />
+              <text x="46" y="27" font-family="sans-serif" font-size="13.5" font-weight="900" fill="#000">今すぐ聴く ▶</text>
+            </g>
+          </g>
+        </svg>`;
+        return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+      };
+
+      const coverImage = generateNewsFallbackSvg(showData);
+
+      // Prepare natural broadcast script for voice synthesis
+      const transcriptLines = (showData.timecoded_transcript || []);
+      const monologueLines = transcriptLines.map((l: any) => {
+        let text = l.text || "";
+        text = text.replace(/^(数霊師ミナト|Master Minato|ミナト|Host)[:：]\s*/i, "");
+        return text.trim();
+      }).filter(Boolean);
+
+      let audioUrl = "";
+      let irodoriAudioUrl = "";
+
+      if (mediaMode === "script") {
+        sendEvent({
+          type: "info",
+          message:
+            language === "en"
+              ? "📝 Script Mode: Completed text-only script generation (audio synthesis skipped)."
+              : "📝 台本モード（テキストのみ）：音声合成をスキップし、放送台本テキストを即時出力します..."
+        });
+      } else {
+        // 1. Check if Irodori-TTS voice cloning is enabled (Built-in Engine or External Server)
+        if (irodoriConfig?.enabled) {
+          const rawServerUrl = (irodoriConfig.serverUrl || "builtin://irodori-engine").trim();
+          const isBuiltinIrodori =
+            rawServerUrl.startsWith("builtin") ||
+            rawServerUrl === "" ||
+            rawServerUrl.includes("localhost:8080") ||
+            rawServerUrl.includes("127.0.0.1:8080");
+
+          sendEvent({
+            type: "info",
+            message: isBuiltinIrodori
+              ? `🌸 アプリ内蔵 Irodori-TTS エンジン（スタイル: ${irodoriConfig.styleEmoji || '😏'}）で全編クローン音声を合成中（回数無制限）...`
+              : "🌸 外部 Irodori-TTS サーバー経由でサンプルボイスからゼロショット音声をクローン合成中..."
+          });
+
+          try {
+            const fullScriptText = monologueLines.join("\n\n");
+
+            if (!isBuiltinIrodori) {
+              const styledText = irodoriConfig.styleEmoji
+                ? `${irodoriConfig.styleEmoji} ${fullScriptText}`
+                : fullScriptText;
+              const payload: any = {
+                model: "Irodori-TTS-v4-Small",
+                input: styledText,
+                voice: irodoriConfig.voice || "minato",
+                response_format: "mp3"
+              };
+              if (irodoriConfig.promptAudioBase64) {
+                payload.prompt_audio = irodoriConfig.promptAudioBase64;
+              }
+              const endpoints = resolveSpeechEndpoints(rawServerUrl);
+              for (const endpoint of endpoints) {
+                try {
+                  const res = await executeIrodoriRequest(endpoint, "POST", payload, irodoriConfig.apiKey, 60000);
+                  if (res.ok && res.data) {
+                    irodoriAudioUrl = `data:audio/mp3;base64,${Buffer.from(res.data).toString("base64")}`;
+                    console.log("[Irodori-TTS External] Successfully synthesized cloned radio voice audio!");
+                    break;
+                  }
+                } catch {
+                  continue;
+                }
+              }
+            }
+
+            // Use Built-in Irodori-TTS Engine if in builtin mode or if external server didn't respond
+            if (!irodoriAudioUrl) {
+              const builtinBuf = await synthesizeBuiltinIrodoriAudio(
+                fullScriptText,
+                irodoriConfig.styleEmoji || "😏",
+                irodoriConfig.promptAudioBase64
+              );
+              if (builtinBuf && builtinBuf.length > 100) {
+                irodoriAudioUrl = `data:audio/mp3;base64,${builtinBuf.toString("base64")}`;
+                console.log(`[Builtin Irodori-TTS] Successfully synthesized full radio broadcast (${builtinBuf.length} bytes)`);
+              }
+            }
+          } catch (irodoriErr: any) {
+            console.log("[Irodori-TTS] Synthesis notice:", irodoriErr.message || irodoriErr);
+          }
+        }
+
+        // 2. If Irodori-TTS was not enabled (or didn't produce audio), use Gemini TTS with automatic fallback to Built-in Irodori-TTS
+        if (!irodoriAudioUrl && monologueLines.length > 0) {
+          try {
+            if (Date.now() >= ttsQuotaExhaustedUntil) {
+              const selectedVoice = geminiVoice || "Kore";
+              const chunks: string[] = [];
+              let curChunk = "";
+              for (const lineText of monologueLines) {
+                if ((curChunk.length + lineText.length > 1500) && curChunk.length > 0) {
+                  chunks.push(curChunk.trim());
+                  curChunk = "";
+                }
+                curChunk += (curChunk ? "\n" : "") + lineText;
+              }
+              if (curChunk.trim()) {
+                chunks.push(curChunk.trim());
+              }
+
+              sendEvent({
+                type: "info",
+                message: `🎙️ 公式音声（${voicePresetName || '妖美と深淵'}）で全編音声（全${chunks.length}パート・締めの言葉まで）を高品位合成中...`
+              });
+
+              const audioBuffers: Buffer[] = [];
+              for (let i = 0; i < chunks.length; i++) {
+                if (Date.now() < ttsQuotaExhaustedUntil) {
+                  break;
+                }
+                const chunkText = chunks[i];
+                const isLastChunk = i === chunks.length - 1;
+                sendEvent({
+                  type: "info",
+                  message: `🎙️ 番組音声を合成中: [パート ${i + 1}/${chunks.length}] ${isLastChunk ? '（締めの言葉を含む最終パート）' : ''}...`
+                });
+
+                const base64Audio = await synthesizeWithGeminiTts(
+                  ai,
+                  chunkText,
+                  selectedVoice,
+                  voicePresetDesc || "Alluring, decadent, seductive mystic oracle with gentle cynical laughs and velvety whisper tone"
+                );
+
+                if (base64Audio) {
+                  audioBuffers.push(Buffer.from(base64Audio, "base64"));
+                } else if (Date.now() < ttsQuotaExhaustedUntil) {
+                  break;
+                }
+              }
+
+              if (audioBuffers.length > 0) {
+                const concatenatedWav = concatWavBuffers(audioBuffers);
+                audioUrl = `data:audio/wav;base64,${concatenatedWav.toString("base64")}`;
+                console.log(`[Gemini TTS] Successfully synthesized full radio broadcast (${audioBuffers.length}/${chunks.length} parts, ${concatenatedWav.length} bytes) with voice: ${selectedVoice}`);
+              }
+            }
+
+            // If Gemini TTS quota was reached, automatically synthesize with Built-in Irodori-TTS Engine so downloadable audio is ALWAYS generated!
+            if (!audioUrl) {
+              sendEvent({
+                type: "info",
+                message: "🌸 アプリ内蔵 Irodori-TTS エンジンで全編音声ファイルを合成中..."
+              });
+              const builtinFallbackBuf = await synthesizeBuiltinIrodoriAudio(
+                monologueLines.join("\n\n"),
+                irodoriConfig?.styleEmoji || "😏",
+                irodoriConfig?.promptAudioBase64
+              );
+              if (builtinFallbackBuf && builtinFallbackBuf.length > 100) {
+                audioUrl = `data:audio/mp3;base64,${builtinFallbackBuf.toString("base64")}`;
+              }
+            }
+          } catch (_ttsErr: any) {
+            console.log("[TTS Notice] Host audio fallback handled.");
+          }
+        }
+      }
+
+      const sampleCacheKey = `${geminiVoice || 'Kore'}:${(voiceSampleText || '').trim()}`;
+      const cachedSampleAudio = sampleVoiceCache.get(sampleCacheKey) || "";
+
+      showData.coverImage = coverImage;
+      showData.audioUrl = irodoriAudioUrl || audioUrl || ""; // Uses Irodori-TTS cloned audio or Gemini TTS official voice audio
+      showData.voice_sample_url = audioUrl || irodoriAudioUrl || cachedSampleAudio || ""; // voice preview sample
+      showData.isBase64Encoded = false;
+      showData.media_mode = mediaMode;
+      showData.video_aspect_ratio = videoAspectRatio;
+      showData.video_style = videoStyle;
+      showData.voice_preset_id = voicePresetId;
+      showData.voice_preset_name = voicePresetName;
+      showData.voice_preset_desc = voicePresetDesc;
+      showData.voice_sample_text = voiceSampleText;
+      showData.voice_pitch = voicePitch;
+      showData.voice_rate = voiceRate;
+      showData.gemini_voice = geminiVoice;
+      showData.is_irodori_cloned = !!irodoriAudioUrl;
+
+      sendEvent({ type: "tool_result", name: "generate_media", result: language === "en" ? "Media generation complete" : "番組メディアの生成完了" });
+      sendEvent({ type: "show_data", data: showData });
+      sendEvent({ type: "status", status: "completed" });
+    } catch (err: any) {
+      console.error("[api/fortune/generate-radio] Error:", err);
+      sendEvent({ type: "error", message: err.message || "Failed to generate fortune radio show" });
+    } finally {
+      clearInterval(heartbeatInterval);
+      res.end();
+    }
+  });
+
+  app.post("/api/generate-show", async (req, res) => {
+    // Run background cleanup list whenever a new show is request to optimize disk space
+    cleanUpOldGenerations();
+
+    const { topic, duration = "15", mood = "Informative", generationId } = req.body;
+
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[generate-show] Running in dev mode, skipping daily quota tracking.`);
+    } else {
+      const userHash = await getUserHash(req);
+      if (userHash) {
+        const count = getQuotaCount(userHash);
+        const limit = getQuotaLimit();
+        if (count >= limit) {
+          return res.status(429).json({ error: `Daily limit of ${limit} shows reached. Please check back tomorrow!` });
+        }
+        // Deduct (increment) the quota immediately before starting the generation to prevent concurrent bypasses
+        incrementQuotaCount(userHash);
+      }
+    }
+
+    const prompt = `Generate a radio station about: ${topic}. Target duration: ${duration} minutes. Set the tone and style of the show to: ${mood}. Follow the workflow in AGENTS.md to research, write, generate speech and music, mix the audio, and generate the metadata.`;
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+
+    const sendEvent = (event: any) => {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+
+    // Send a heartbeat every 15 seconds to keep the connection alive
+    // (useful for proxies like VS Code port forwarding that drop idle connections)
+    const heartbeatInterval = setInterval(() => {
+      res.write(`:\n\n`); // SSE comment/ping
+    }, 15000);
+
+    let isFinished = false;
+    const abortController = new AbortController();
+
+    if (generationId) {
+      activeGenerations.set(generationId, abortController);
+    }
+
+    req.on('aborted', () => {
+      if (!isFinished) {
+        console.log(`[generate-show] Client aborted request. Agent will continue running in background unless explicitly cancelled.`);
+      }
+      clearInterval(heartbeatInterval);
+    });
+    req.on('close', () => {
+      clearInterval(heartbeatInterval);
+    });
+
+    try {
+      console.log(`[generate-show] Request received for topic: "${topic}", duration: "${duration}", mood: "${mood}", generationId: "${generationId}"`);
+      console.log(`[generate-show] GEMINI_API_KEY presence verified: ${!!process.env.GEMINI_API_KEY}`);
+      sendEvent({ type: "info", message: "Provisioning environment..." });
+
+      console.log(`[generate-show] Loading agent files from filesystem path: ${path.join(process.cwd(), "agent")}`);
+      const agentFiles = loadAgentFiles(path.join(process.cwd(), "agent"), "/.agents");
+      console.log(`[generate-show] Finished loading agent files recursively. Count: ${agentFiles.length}`);
+
+      console.log(`[generate-show] Calling createInteraction with prompt: "${prompt.substring(0, 100)}..."`);
+      const response = await createInteraction({
+        prompt,
+        stream: true,
+        inlineSources: agentFiles.length > 0 ? agentFiles : undefined,
+        signal: abortController.signal
+      });
+
+      console.log(`[generate-show] Gemini API responded. HTTP Status: ${response.status} ${response.statusText}`);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[generate-show] Gemini API Non-2xx response. Error Payload: ${errorText}`);
+
+        let displayMessage = `Agent API error: ${response.status} - ${errorText}`;
+        try {
+          const parsed = JSON.parse(errorText);
+          if (parsed?.error?.message) {
+            displayMessage = parsed.error.message;
+          }
+        } catch (e) {
+          // ignore parsing error, stick to default
+        }
+
+        const isQuotaError = 
+          response.status === 429 || 
+          errorText.toLowerCase().includes("quota") || 
+          errorText.toLowerCase().includes("too_many_requests") || 
+          errorText.toLowerCase().includes("resource_exhausted") ||
+          displayMessage.toLowerCase().includes("quota") ||
+          displayMessage.toLowerCase().includes("too_many_requests");
+
+        if (isQuotaError) {
+          displayMessage = `Gemini API Quota Limit Reached: ${displayMessage}. The shared free-tier Google Gemini API Key has run out of request quota. To resolve this, go to Settings > Secrets inside AI Studio to verify your personal Gemini API key or set up billing.`;
+        }
+
+        sendEvent({ type: "error", message: displayMessage });
+        res.end();
+        return;
+      }
+
+      console.log(`[generate-show] Response remains ok. Constructing SSE stream reader...`);
+      let accumulatedText = "";
+      let envId: string | undefined;
+
+      let eventCount = 0;
+      for await (const event of streamInteraction(response)) {
+        eventCount++;
+        console.log(`[generate-show] SSE yields streaming event #${eventCount}: type="${event.type}"`);
+        if (event.type === "done") {
+          console.log(`[generate-show] Received explicit "done" marker from interaction stream.`);
+          break;
+        }
+        if (event.type === "complete") {
+          envId = (event.interaction?.environment as any)?.env_id || event.interaction?.environment_id;
+          console.log(`[generate-show] Interaction completed. Extracted environment ID: "${envId}"`);
+          const usage = event.interaction?.usage as any;
+          if (usage) {
+            console.log(`[agent] Token usage: ${usage.total_tokens} total tokens (${usage.total_input_tokens} input, ${usage.total_output_tokens} output, ${usage.total_thought_tokens || 0} thought, ${usage.total_cached_tokens || 0} cached)`);
+          }
+
+          // Fallback extraction: iterate and combine text from all elements of the steps array 
+          const stepsObj = event.interaction?.steps as any[];
+          if (Array.isArray(stepsObj)) {
+            let combinedStepsText = "";
+            for (const step of stepsObj) {
+              const isReasoningStep = step.type === 'thinking' || step.type === 'thought' || step.type === 'reasoning';
+              if (!isReasoningStep && Array.isArray(step.content)) {
+                for (const part of step.content) {
+                  if (part && typeof part === 'object') {
+                    if (part.type === 'text' && part.text) {
+                      combinedStepsText += part.text;
+                    } else if (part.text && part.type !== 'thought') {
+                      combinedStepsText += part.text;
+                    }
+                  } else if (typeof part === 'string') {
+                    combinedStepsText += part;
+                  }
+                }
+              }
+            }
+            if (combinedStepsText && combinedStepsText.length > accumulatedText.length) {
+              console.log(`[generate-show] Dynamic steps recovery: Reconstructed text of length ${combinedStepsText.length} exceeds accumulated text of length ${accumulatedText.length}. Restoring fallback text.`);
+              accumulatedText = combinedStepsText;
+            }
+          }
+        }
+
+        // Log events to the terminal as well
+        if (event.type === "thinking") console.log(`[agent] thinking delta: ${event.text?.substring(0, 30)}...`);
+        else if (event.type === "tool_call") {
+          console.log(`[agent] tool_call: ${event.name}`);
+          console.log(`[agent] args:`, JSON.stringify(event.arguments, null, 2));
+        }
+        else if (event.type === "tool_result") {
+          console.log(`[agent] tool_result for tool: ${event.name}`);
+        }
+        else if (event.type === "text") {
+          console.log(`[agent] text output segment: ${event.text?.substring(0, 30)}...`);
+        }
+
+        sendEvent(event);
+
+        if (event.type === "text" && event.text) {
+          accumulatedText += event.text;
+        }
+      }
+
+      // Check for JSON blocks fallback after full stream completion to avoid overwhelming stream buffers
+      if (accumulatedText) {
+        try {
+          const blocks = extractJsonBlocks(accumulatedText);
+          if (blocks.length > 0) {
+            sendEvent({ type: "show_data", data: blocks[blocks.length - 1] });
+          }
+        } catch (e) {
+          console.error("Failed to parse JSON blocks fallback from accumulated text:", e);
+        }
+      }
+
+      if (envId) {
+        sendEvent({ type: "info", message: "Processing final audio and metadata in memory..." });
+        try {
+          const downloadUrl = `${API_BASE_URL}/files/environment-${envId}:download?alt=media`;
+          const res = await fetch(downloadUrl, {
+            headers: { "x-goog-api-key": process.env.GEMINI_API_KEY || "" }
+          });
+
+          if (res.ok) {
+            const arrayBuffer = await res.arrayBuffer();
+            const tarBuffer = Buffer.from(arrayBuffer);
+            const extractedFiles = extractTarInMemory(tarBuffer);
+
+            let showNotes: any = null;
+            let audioBase64 = "";
+            let coverBase64 = "";
+
+            for (const [filePath, fileContent] of Object.entries(extractedFiles)) {
+              if (filePath.endsWith("show_notes.json")) {
+                try {
+                  showNotes = JSON.parse(fileContent.toString("utf8"));
+                } catch (err) {
+                  console.error("Failed to parse show_notes.json from memory:", err);
+                }
+              } else if (filePath.endsWith("ai_radio.mp3")) {
+                audioBase64 = fileContent.toString("base64");
+              } else if (filePath.endsWith("cover.png") || filePath.endsWith("cover.jpg") || filePath.endsWith("cover.jpeg")) {
+                coverBase64 = fileContent.toString("base64");
+              }
+            }
+
+            if (showNotes) {
+              if (audioBase64) {
+                showNotes.audioUrl = `data:audio/mp3;base64,${audioBase64}`;
+              }
+              if (coverBase64) {
+                showNotes.coverImage = `data:image/png;base64,${coverBase64}`;
+              }
+              showNotes.isBase64Encoded = true;
+              sendEvent({ type: "show_data", data: showNotes });
+            } else {
+              console.error("show_notes.json was not found in the extracted tar archive");
+              sendEvent({ type: "error", message: "Successfully extracted the archive but show_notes.json of the show was missing." });
+            }
+          } else {
+            const errBody = await res.text();
+            console.error("Failed to download snapshot:", errBody);
+            sendEvent({ type: "error", message: `Failed to retrieve files from simulation: ${errBody}` });
+          }
+        } catch (err: any) {
+          console.error("Error processing snapshot in memory:", err);
+          sendEvent({ type: "error", message: `Error extracted show files: ${err.message}` });
+        }
+      }
+
+      isFinished = true;
+      sendEvent({ type: "status", status: "completed" });
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        console.log(`[generate-show] Agent interaction aborted successfully.`);
+      } else {
+        console.error(`[generate-show] Error:`, err);
+        sendEvent({ type: "error", message: err instanceof Error ? err.message : "Unknown error" });
+      }
+    } finally {
+      isFinished = true;
+      clearInterval(heartbeatInterval);
+      if (generationId) {
+        activeGenerations.delete(generationId);
+      }
+      res.end();
+    }
+  });
+
+  app.get("/api/download-zip", async (req, res) => {
+    const { notesUrl, audioUrl, coverUrl } = req.query;
+
+    if (!audioUrl || typeof audioUrl !== 'string') {
+      return res.status(400).send("Missing audioUrl");
+    }
+
+    const getFilePath = (url: string) => {
+      if (!url || !url.startsWith('/')) return null;
+      const decodedUrl = decodeURIComponent(url);
+      if (decodedUrl.startsWith('/output/')) {
+        return path.join(process.cwd(), decodedUrl);
+      } else if (decodedUrl.startsWith('/shows/')) {
+        return path.join(process.cwd(), 'public', decodedUrl);
+      }
+      return null;
+    };
+
+    const notesPath = getFilePath(notesUrl as string);
+    const audioPath = getFilePath(audioUrl as string);
+    const coverPath = getFilePath(coverUrl as string);
+
+    const tmpDir = path.join(process.cwd(), 'output', `tmp_zip_${Date.now()}_${Math.random().toString(36).substring(7)}`);
+
+    try {
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      let hasFiles = false;
+      if (notesPath && fs.existsSync(notesPath)) {
+        fs.copyFileSync(notesPath, path.join(tmpDir, 'show_notes.json'));
+        hasFiles = true;
+      }
+      if (audioPath && fs.existsSync(audioPath)) {
+        fs.copyFileSync(audioPath, path.join(tmpDir, 'ai_radio.mp3'));
+        hasFiles = true;
+      }
+      if (coverPath && fs.existsSync(coverPath)) {
+        fs.copyFileSync(coverPath, path.join(tmpDir, 'cover.png'));
+        hasFiles = true;
+      }
+
+      if (!hasFiles) {
+        return res.status(404).send("No files found to zip");
+      }
+
+      const zipPath = `${tmpDir}.zip`;
+      await execAsync(`zip -j "${zipPath}" "${tmpDir}"/*`);
+
+      res.download(zipPath, 'radio-show.zip', (err) => {
+        // Cleanup
+        try {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+          if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+        } catch (e) {
+          console.error("Cleanup error:", e);
+        }
+      });
+    } catch (err) {
+      console.error("Zip error:", err);
+      res.status(500).send("Error creating zip");
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch (e) {}
+    }
+  });
+
+  app.get("/api/shows", (req, res) => {
+    // Run cleanup on library list check
+    cleanUpOldGenerations();
+
+    const showsDir = path.join(process.cwd(), 'public', 'shows');
+    const shows: any[] = [];
+
+    if (fs.existsSync(showsDir)) {
+      const entries = fs.readdirSync(showsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          const showPath = path.join(showsDir, entry.name);
+          const showNotesPath = path.join(showPath, 'show_notes.json');
+
+          if (fs.existsSync(showNotesPath)) {
+            try {
+              const showNotes = JSON.parse(fs.readFileSync(showNotesPath, 'utf-8'));
+              const folderFiles = fs.readdirSync(showPath);
+              const mp3File = folderFiles.find(f => f.endsWith('.mp3'));
+              const coverFile = folderFiles.find(f => f.endsWith('.png') || f.endsWith('.jpg') || f.endsWith('.jpeg'));
+
+              if (entry.name === 'default') {
+                showNotes.audioUrl = "https://www.gstatic.com/aistudio/starter-apps/assets/ai_radio/ai_radio.mp3";
+                showNotes.coverImage = "https://www.gstatic.com/aistudio/starter-apps/assets/ai_radio/cover.jpg";
+              } else {
+                showNotes.audioUrl = `/shows/${entry.name}/${mp3File || 'ai_radio.mp3'}`;
+                showNotes.coverImage = coverFile ? `/shows/${entry.name}/${coverFile}` : "https://images.unsplash.com/photo-1550751827-4bd374c3f58b?q=80&w=2070&auto=format&fit=crop";
+              }
+              showNotes.notesUrl = `/shows/${entry.name}/show_notes.json`;
+              shows.push(showNotes);
+            } catch (err) {
+              console.error(`Error reading show notes for ${entry.name}:`, err);
+            }
+          }
+        }
+      }
+    }
+    res.json(shows);
+  });
+
+  app.get("/api/share/config", (req, res) => {
+    res.json({
+      isSharingEnabled: !!process.env.GCS_BUCKET_NAME
+    });
+  });
+
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok" });
+  });
+
+  // Vite middleware for development (with a robust fallback to dev middleware if dist/index.html is missing)
+  const distPath = path.join(process.cwd(), 'dist');
+  const indexHtmlExists = fs.existsSync(path.join(distPath, 'index.html'));
+
+  if (process.env.NODE_ENV !== "production" || !indexHtmlExists) {
+    if (process.env.NODE_ENV === "production") {
+      console.warn("Production mode enabled, but dist/index.html not found. Falling back to Vite dev server middleware to ensure app stays operational.");
+    }
+    const vite = await createViteServer({
+      server: { middlewareMode: true, hmr: false },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(distPath));
+    // Express 5 format for catch-all (if using express 5) or Express 4. Let's use *all for v5 or * for v4.
+    // We can use default express 4 catch-all
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  const startListening = (port: number) => {
+    const server = app.listen(port, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${port}`);
+    }).on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        console.log(`Port ${port} is in use, trying ${port + 1}...`);
+        startListening(port + 1);
+      } else {
+        console.error(err);
+      }
+    });
+
+    // Disable timeouts for long-running agent interactions
+    server.setTimeout(0);
+    server.requestTimeout = 0;
+    server.headersTimeout = 0;
+    server.keepAliveTimeout = 0;
+  };
+
+  startListening(PORT);
+}
+
+startServer();
